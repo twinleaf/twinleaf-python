@@ -1,14 +1,13 @@
 [package]
-name = "twinleaf-py"
-version = "0.1.3"
+name = "twinleaf-python"
+version = "0.2.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "_twinleaf"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.26", features = ["extension-module"] }
-twinleaf = { version = "1.7" }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+twinleaf = "1.7"
 crossbeam = "0.8"
