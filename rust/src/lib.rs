@@ -2,11 +2,11 @@ use ::twinleaf::tio::*;
 use ::twinleaf::*;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
-#[pyclass(name = "DataIterator", subclass)]
+#[pyclass(name = "_DataIterator", subclass)]
 struct PyIter {
-    port: data::Device,
+    port: device::Device,
     n: Option<usize>,
     stream: String,
     columns: Vec<String>,
@@ -80,11 +80,88 @@ impl PyIter {
     }
 }
 
-#[pyclass(name = "Device", subclass)]
+#[pyclass(name = "_Rpc")]
+#[derive(Clone)]
+struct PyRpc {
+    inner: device::RpcDescriptor,
+}
+
+#[pymethods]
+impl PyRpc {
+    #[getter]
+    fn name(&self) -> String {
+        self.inner.full_name.clone()
+    }
+
+    #[getter]
+    fn readable(&self) -> bool {
+        self.inner.readable
+    }
+
+    #[getter]
+    fn writable(&self) -> bool {
+        self.inner.writable
+    }
+
+    #[getter]
+    fn size_bytes(&self) -> Option<usize> {
+        self.inner.size_bytes()
+    }
+
+    #[getter]
+    fn type_str(&self) -> String {
+        self.inner.type_str()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "_twinleaf._Rpc({} {}({}))",
+            self.inner.perm_str(),
+            self.inner.full_name,
+            self.inner.type_str(),
+        )
+    }
+}
+
+#[pyclass(name = "_RpcRegistry")]
+struct PyRegistry {
+    inner: device::RpcRegistry,
+}
+
+#[pymethods]
+impl PyRegistry {
+    fn children_of(&self, prefix: &str) -> Vec<String> {
+        self.inner.children_of(prefix)
+    }
+
+    fn find(&self, name: &str) -> Option<PyRpc> {
+        self.inner.find(name).map(|desc| PyRpc { inner: desc.clone() })
+    }
+
+    fn suggest(&self, query: &str) -> Vec<String> {
+        self.inner.suggest(query)
+    }
+
+    fn search(&self, query: &str) -> Vec<String> {
+        self.inner.search(query)
+    }
+
+    #[getter]
+    fn hash(&self) -> Option<u32> {
+        self.inner.hash
+    }
+
+    fn __repr__(&self) -> String {
+        format!("_twinleaf._RpcRegistry({:?})", self.children_of(""))
+    }
+}
+
+#[pyclass(name = "_Device", subclass)]
 struct PyDevice {
+    root: String,
     proxy: proxy::Interface,
     route: proto::DeviceRoute,
-    rpc: proxy::Port,
+    rpc: device::RpcClient,
 }
 
 #[pymethods]
@@ -103,14 +180,38 @@ impl PyDevice {
             proto::DeviceRoute::root()
         };
         let proxy = proxy::Interface::new(&root);
-        let rpc = proxy.device_rpc(route.clone()).unwrap();
-        Ok(PyDevice { proxy, route, rpc })
+        let rpc = device::RpcClient::open(&proxy, route.clone()).unwrap();
+        Ok(PyDevice { root, proxy, route, rpc })
+    }
+
+    #[getter]
+    fn _url(&self) -> String {
+        self.root.clone()
+    }
+
+    #[getter]
+    fn _route(&self) -> String {
+        format!("{}", self.route)
     }
 
     fn _rpc<'py>(&self, py: Python<'py>, name: &str, req: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-        match self.rpc.raw_rpc(name, req) {
+        match self.rpc.raw_rpc(&self.route, name, req) {
             Ok(ret) => Ok(PyBytes::new(py, &ret[..])),
             _ => Err(PyRuntimeError::new_err(format!("RPC '{}' failed", name))),
+        }
+    }
+
+    fn _rpc_list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        match self.rpc.rpc_list(&self.route) {
+            Ok(ret) => Ok(PyList::new(py, ret.vec)?),
+            Err(e) => Err(PyRuntimeError::new_err(format!("{:?}", e))),
+        }
+    }
+
+    fn _rpc_registry(&self) -> PyResult<PyRegistry> {
+        match self.rpc.rpc_list(&self.route) {
+            Ok(list) => Ok(PyRegistry { inner: device::RpcRegistry::from(&list) }),
+            Err(e) => Err(PyRuntimeError::new_err(format!("{:?}", e))),
         }
     }
 
@@ -123,7 +224,7 @@ impl PyDevice {
         columns: Option<Vec<String>>,
     ) -> PyResult<PyIter> {
         Ok(PyIter {
-            port: data::Device::new(self.proxy.device_full(self.route.clone()).unwrap()),
+            port: device::Device::new(self.proxy.device_full(self.route.clone()).unwrap()),
             n: n,
             stream: stream.unwrap_or_default(),
             columns: columns.unwrap_or_default(),
@@ -131,7 +232,7 @@ impl PyDevice {
     }
 
     fn _get_metadata<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let mut device = data::Device::new(self.proxy.device_full(self.route.clone()).unwrap());
+        let mut device = device::Device::new(self.proxy.device_full(self.route.clone()).unwrap());
         let meta = match device.get_metadata() {
             Ok(meta) => meta,
             Err(_) => return Err(PyRuntimeError::new_err("Failed to get metadata")),
@@ -179,5 +280,7 @@ impl PyDevice {
 #[pymodule]
 fn _twinleaf(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
+    m.add_class::<PyRpc>()?;
+    m.add_class::<PyRegistry>()?;
     Ok(())
 }
