@@ -9,5 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.28", features = ["extension-module"] }
-twinleaf = "1.7"
+twinleaf = "1.7.1"
 crossbeam = "0.8"

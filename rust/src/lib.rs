@@ -81,7 +81,7 @@ impl PyIter {
 }
 
 #[pyclass(name = "_Rpc")]
-#[derive(Clone)]
+// #[derive(Clone)]
 struct PyRpc {
     inner: device::RpcDescriptor,
 }
