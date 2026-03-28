@@ -14,6 +14,11 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: Apache Software License",
 ]
+license = "MIT AND Apache-2.0"
+license-files = [
+  "LICENSE-APACHE.txt",
+  "LICENSE-MIT.txt"
+]
 dynamic = ["version"]
 dependencies = [
     "ipython>=9",
