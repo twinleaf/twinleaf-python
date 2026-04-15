@@ -1,4 +1,4 @@
-from twinleaf import _twinleaf
+from twinleaf import _twinleaf  # type: ignore[attr-defined]
 
 class Device(_twinleaf._Device):
     """ Primary TIO interface with sensor object """
@@ -31,6 +31,7 @@ class Device(_twinleaf._Device):
             case 2, False: fstr = '<H'
             case 4, False: fstr = '<I'
             case 8, False: fstr = '<Q'
+            case _: raise ValueError(f"Unsupported int size/signed combo: {size}, {signed}")
         payload = b'' if value is None else struct.pack(fstr, value)
         rep = self._rpc(name, payload)
         val = struct.unpack(fstr, rep)[0]
@@ -197,7 +198,7 @@ class _Rpc(_RpcNode):
                 subclass = _RpcReadOnly
             case _:
                 subclass = _RpcAction
-        rpc = super().__new__(subclass)
+        rpc = super().__new__(subclass)  # type: ignore[arg-type]
         return rpc
 
     def __init__(self, pyrpc: _twinleaf._Rpc, device: Device):
@@ -242,11 +243,14 @@ class _Rpc(_RpcNode):
     def _call(self, arg: _rpc_type=None) -> _rpc_type:
         match self._type:
             case t if t is int:
+                assert arg is None or isinstance(arg, int)
                 return self._device._rpc_int(self.__name__, self._data_size, self._signed, arg)
             case t if t is float:
+                assert arg is None or isinstance(arg, float)
                 return self._device._rpc_float(self.__name__, self._data_size, arg)
             case t if t is str:
                 if arg is None: arg = ''
+                assert isinstance(arg, str)
                 return self._device._rpc(self.__name__, arg.encode()).decode()
             case t if t is bytes:
                 if arg is None: arg = b''
