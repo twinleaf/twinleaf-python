@@ -614,8 +614,6 @@ dependencies = [
 [[package]]
 name = "twinleaf"
 version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c180ec059413e1a1f51f16b9d35f905a744a0bd2e3c78227b9b40da5ea43a15"
 dependencies = [
  "crc",
  "crossbeam",

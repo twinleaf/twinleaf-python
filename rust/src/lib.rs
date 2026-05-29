@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use ::twinleaf::tio::*;
 use ::twinleaf::*;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
@@ -113,6 +115,16 @@ impl PyRpc {
         self.inner.type_str()
     }
 
+    #[getter]
+    fn is_capture(&self) -> bool {
+        self.inner.is_capture
+    }
+
+    #[getter]
+    fn meta_raw(&self) -> u16 {
+        self.inner.meta_raw
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "_twinleaf._Rpc({} {}({}))",
@@ -201,18 +213,82 @@ impl PyDevice {
         }
     }
 
-    fn _rpc_list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        match self.rpc.rpc_list(&self.route) {
-            Ok(ret) => Ok(PyList::new(py, ret.vec)?),
-            Err(e) => Err(PyRuntimeError::new_err(format!("{:?}", e))),
+    #[pyo3(signature = (name, timeout_seconds=5.0))]
+    fn _capture<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        timeout_seconds: f64,
+    ) -> PyResult<Py<PyAny>> {
+        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+            return Err(PyValueError::new_err(
+                "capture timeout must be a non-negative finite number of seconds",
+            ));
         }
+
+        let timeout = Duration::from_secs_f64(timeout_seconds);
+        let readout = device::capture::read_capture(&self.rpc, name, timeout)
+            .map_err(|err| {
+                PyRuntimeError::new_err(format!("Capture RPC '{}' failed: {}", name, err))
+            })?;
+        let values = readout
+            .values_f64()
+            .map_err(|err| {
+                PyRuntimeError::new_err(format!("Capture RPC '{}' failed: {}", name, err))
+            })?;
+        let x_values = readout.x_values_f64();
+        let meta = &readout.metadata;
+
+        let metadata = PyDict::new(py);
+        metadata.set_item("size", meta.size)?;
+        metadata.set_item("blocksize", meta.blocksize)?;
+        metadata.set_item("data_type", meta.data_type_label())?;
+        metadata.set_item("length", meta.length)?;
+        metadata.set_item("y_calibration", meta.y_calibration)?;
+        metadata.set_item("x_offset", meta.x_offset)?;
+        metadata.set_item("x_stride", meta.x_stride)?;
+        metadata.set_item("name", &meta.name)?;
+        metadata.set_item("units", &meta.units)?;
+        metadata.set_item("x_name", &meta.x_name)?;
+        metadata.set_item("x_units", &meta.x_units)?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("metadata", metadata)?;
+        dict.set_item("data", PyBytes::new(py, &readout.data))?;
+        dict.set_item("x", x_values)?;
+        dict.set_item("y", values)?;
+
+        Ok(dict.into())
+    }
+
+    fn _rpc_list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let port = self
+            .proxy
+            .subtree_rpc(self.route.clone())
+            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let specs = device::util::load_rpc_specs(&port)
+            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let list: Vec<_> = specs
+            .into_iter()
+            .map(|spec| (spec.full_name, spec.meta_raw))
+            .collect();
+        Ok(PyList::new(py, list)?)
     }
 
     fn _rpc_registry(&self) -> PyResult<PyRegistry> {
-        match self.rpc.rpc_list(&self.route) {
-            Ok(list) => Ok(PyRegistry { inner: device::RpcRegistry::from(&list) }),
-            Err(e) => Err(PyRuntimeError::new_err(format!("{:?}", e))),
-        }
+        let port = self
+            .proxy
+            .subtree_rpc(self.route.clone())
+            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let specs = device::util::load_rpc_specs(&port)
+            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let hash = self
+            .rpc
+            .get(&self.route, "rpc.hash")
+            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let mut registry = device::RpcRegistry::new(specs);
+        registry.hash = Some(hash);
+        Ok(PyRegistry { inner: registry })
     }
 
     #[pyo3(signature = (n=None, stream=None, columns=None))]
