@@ -246,8 +246,11 @@ class _Rpc(_RpcNode):
                 assert arg is None or isinstance(arg, int)
                 return self._device._rpc_int(self.__name__, self._data_size, self._signed, arg)
             case t if t is float:
-                assert arg is None or isinstance(arg, float)
-                return self._device._rpc_float(self.__name__, self._data_size, arg)
+                try:
+                    value = None if arg is None else float(arg)
+                except (TypeError, ValueError) as err:
+                    raise TypeError(f"{self.__name__} expects a float-compatible value") from err
+                return self._device._rpc_float(self.__name__, self._data_size, value)
             case t if t is str:
                 if arg is None: arg = ''
                 assert isinstance(arg, str)
