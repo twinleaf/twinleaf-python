@@ -307,12 +307,12 @@ class _Rpc(_RpcNode):
         ret += ")"
         return ret
 
-    def _call(self, arg: _rpc_type=None) -> _rpc_type:
+    def _call(self, arg: _rpc_type=None, *, raw: bool=False) -> _rpc_type:
         if self._is_capture:
             if arg is None:
-                return self._device._capture(self.__name__)
+                return self._device._capture(self.__name__, 5.0, raw)
             assert isinstance(arg, (int, float))
-            return self._device._capture(self.__name__, float(arg))
+            return self._device._capture(self.__name__, float(arg), raw)
 
         match self._type:
             case t if t is int:
@@ -349,10 +349,10 @@ class _Rpc(_RpcNode):
 
 
 class _RpcReadOnly(_Rpc):
-    def __call__(self, timeout: float | None = None):
+    def __call__(self, timeout: float | None = None, *, raw: bool=False):
         if self._is_capture:
-            return self._call(timeout)
-        if timeout is not None:
+            return self._call(timeout, raw=raw)
+        if timeout is not None or raw:
             raise TypeError(f"{self.__name__} is read-only and does not accept an argument")
         return self._call()
 
@@ -376,8 +376,8 @@ class _RpcCapture(_Rpc):
     def __repr__(self):
         return f"{self.__module__}.{self.__class__.__name__}('{self.__name__}', capture=True)"
 
-    def __call__(self, timeout: float = 5.0) -> dict:
-        return self._device._capture(self.__name__, timeout)
+    def __call__(self, timeout: float = 5.0, *, raw: bool=False) -> dict:
+        return self._device._capture(self.__name__, timeout, raw)
 
 # Samples classes
 class _SamplesBase:

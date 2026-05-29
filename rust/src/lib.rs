@@ -213,12 +213,13 @@ impl PyDevice {
         }
     }
 
-    #[pyo3(signature = (name, timeout_seconds=5.0))]
+    #[pyo3(signature = (name, timeout_seconds=5.0, raw=false))]
     fn _capture<'py>(
         &self,
         py: Python<'py>,
         name: &str,
         timeout_seconds: f64,
+        raw: bool,
     ) -> PyResult<Py<PyAny>> {
         if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
             return Err(PyValueError::new_err(
@@ -239,22 +240,21 @@ impl PyDevice {
         let x_values = readout.x_values_f64();
         let meta = &readout.metadata;
 
-        let metadata = PyDict::new(py);
-        metadata.set_item("size", meta.size)?;
-        metadata.set_item("blocksize", meta.blocksize)?;
-        metadata.set_item("data_type", meta.data_type_label())?;
-        metadata.set_item("length", meta.length)?;
-        metadata.set_item("y_calibration", meta.y_calibration)?;
-        metadata.set_item("x_offset", meta.x_offset)?;
-        metadata.set_item("x_stride", meta.x_stride)?;
-        metadata.set_item("name", &meta.name)?;
-        metadata.set_item("units", &meta.units)?;
-        metadata.set_item("x_name", &meta.x_name)?;
-        metadata.set_item("x_units", &meta.x_units)?;
-
         let dict = PyDict::new(py);
-        dict.set_item("metadata", metadata)?;
-        dict.set_item("data", PyBytes::new(py, &readout.data))?;
+        if raw {
+            dict.set_item("size", meta.size)?;
+            dict.set_item("blocksize", meta.blocksize)?;
+            dict.set_item("data_type", meta.data_type_label())?;
+            dict.set_item("length", meta.length)?;
+            dict.set_item("y_calibration", meta.y_calibration)?;
+            dict.set_item("x_offset", meta.x_offset)?;
+            dict.set_item("x_stride", meta.x_stride)?;
+            dict.set_item("data", PyBytes::new(py, &readout.data))?;
+        }
+        dict.set_item("name", &meta.name)?;
+        dict.set_item("units", &meta.units)?;
+        dict.set_item("x_name", &meta.x_name)?;
+        dict.set_item("x_units", &meta.x_units)?;
         dict.set_item("x", x_values)?;
         dict.set_item("y", values)?;
 
