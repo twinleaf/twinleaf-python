@@ -226,7 +226,7 @@ class _Rpc(_RpcNode):
             case '' if self._data_size == 0:
                 self._type = None
                 self._data_type = 0
-            case other:
+            case _:
                 self._type = bytes
                 self._data_type = 0
 
@@ -234,7 +234,7 @@ class _Rpc(_RpcNode):
         ret = super().__repr__().strip(')') + ", "
         if hasattr(self, '_signed') and not self._signed:
             ret += "u"
-        ret += self._type.__name__
+        ret += self._type.__name__ if self._type is not None else "none"
         if self._data_size: # is not 0 or None
             ret += str(self._data_size*8)
         ret += ')'
@@ -244,12 +244,14 @@ class _Rpc(_RpcNode):
         match self._type:
             case t if t is int:
                 assert arg is None or isinstance(arg, int)
+                assert self._data_size is not None
                 return self._device._rpc_int(self.__name__, self._data_size, self._signed, arg)
             case t if t is float:
                 try:
                     value = None if arg is None else float(arg)
                 except (TypeError, ValueError) as err:
                     raise TypeError(f"{self.__name__} expects a float-compatible value") from err
+                assert self._data_size is not None
                 return self._device._rpc_float(self.__name__, self._data_size, value)
             case t if t is str:
                 if arg is None: arg = ''
@@ -257,6 +259,7 @@ class _Rpc(_RpcNode):
                 return self._device._rpc(self.__name__, arg.encode()).decode()
             case t if t is bytes:
                 if arg is None: arg = b''
+                assert isinstance(arg, bytes)
                 return self._device._rpc(self.__name__, arg)
             case None:
                 return self._device._rpc(self.__name__, b'')
@@ -277,7 +280,7 @@ class _RpcReadWrite(_Rpc):
 
 class _RpcAction(_Rpc):
     def __call__(self) -> None:
-        return self._call()
+        self._call()
 
 # Samples classes
 class _SamplesBase:
