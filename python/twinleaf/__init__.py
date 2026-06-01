@@ -296,8 +296,8 @@ class _SamplesDict(_SamplesBase):
     def __init__(self, device: Device, name: str, stream: str="", columns: list[str] | None=None):
         super().__init__(device, name, stream, columns if columns is not None else [] )
 
-    def __call__(self, n: int=1, *, time_column=True, title_row=True):
-        return self._device._samples_dict(n, self._stream, self._columns, time_column=time_column, title_row=title_row)
+    def __call__(self, n: int=1):
+        return self._device._samples_dict(n, self._stream, self._columns)
 
 class _SamplesList(_SamplesBase):
     """ Returns samples as list for single stream """
