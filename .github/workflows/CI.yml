@@ -24,6 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
       - name: Ruff lint
         run: uvx ruff@0.15.10 check
       - name: Ruff format
@@ -38,16 +40,8 @@ jobs:
         platform:
           - runner: ubuntu-latest
             target: x86_64
-          - runner: ubuntu-latest
-            target: x86
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
             target: aarch64
-          - runner: ubuntu-latest
-            target: armv7
-          - runner: ubuntu-latest
-            target: s390x
-          - runner: ubuntu-latest
-            target: ppc64le
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -77,12 +71,8 @@ jobs:
         platform:
           - runner: ubuntu-latest
             target: x86_64
-          - runner: ubuntu-latest
-            target: x86
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
             target: aarch64
-          - runner: ubuntu-latest
-            target: armv7
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
