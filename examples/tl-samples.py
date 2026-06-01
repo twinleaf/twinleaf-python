@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import twinleaf
-import pprint
 
 dev = twinleaf.Device()
 
