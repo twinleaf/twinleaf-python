@@ -1,4 +1,4 @@
-from twinleaf import _twinleaf  # type: ignore[attr-defined]
+from twinleaf import _twinleaf
 
 class Device(_twinleaf._Device):
     """ Primary TIO interface with sensor object """
