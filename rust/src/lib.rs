@@ -97,40 +97,49 @@ impl PyRpc {
 
     #[getter]
     fn readable(&self) -> bool {
-        self.inner.readable
+        self.inner
+            .meta
+            .flags()
+            .contains(device::RpcMetaFlags::READABLE)
     }
 
     #[getter]
     fn writable(&self) -> bool {
-        self.inner.writable
+        self.inner
+            .meta
+            .flags()
+            .contains(device::RpcMetaFlags::WRITABLE)
     }
 
     #[getter]
     fn size_bytes(&self) -> Option<usize> {
-        self.inner.size_bytes()
+        self.inner.meta.size_bytes()
     }
 
     #[getter]
     fn type_str(&self) -> String {
-        self.inner.type_str()
+        self.inner.meta.type_str()
     }
 
     #[getter]
     fn is_capture(&self) -> bool {
-        self.inner.is_capture
+        self.inner
+            .meta
+            .flags()
+            .contains(device::RpcMetaFlags::CAPTURE)
     }
 
     #[getter]
     fn meta_raw(&self) -> u16 {
-        self.inner.meta_raw
+        self.inner.meta.bits()
     }
 
     fn __repr__(&self) -> String {
         format!(
             "_twinleaf._Rpc({} {}({}))",
-            self.inner.perm_str(),
+            self.inner.meta.perm_str(),
             self.inner.full_name,
-            self.inner.type_str(),
+            self.inner.meta.type_str(),
         )
     }
 }
@@ -151,11 +160,19 @@ impl PyRegistry {
     }
 
     fn suggest(&self, query: &str) -> Vec<String> {
-        self.inner.suggest(query)
+        self.inner
+            .iter()
+            .map(|desc| desc.full_name.clone())
+            .filter(|name| name.starts_with(query))
+            .collect()
     }
 
     fn search(&self, query: &str) -> Vec<String> {
-        self.inner.search(query)
+        self.inner
+            .iter()
+            .map(|desc| desc.full_name.clone())
+            .filter(|name| name.contains(query))
+            .collect()
     }
 
     #[getter]
@@ -270,7 +287,7 @@ impl PyDevice {
             .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
         let list: Vec<_> = specs
             .into_iter()
-            .map(|spec| (spec.full_name, spec.meta_raw))
+            .map(|spec| (spec.full_name, spec.meta.bits()))
             .collect();
         Ok(PyList::new(py, list)?)
     }
