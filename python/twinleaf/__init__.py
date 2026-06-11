@@ -199,14 +199,16 @@ class Device(_twinleaf._Device):
 
 type _rpc_type = int | float | str | bytes | None
 
+
 def _is_capture_rpc(pyrpc: _twinleaf._Rpc) -> bool:
-    meta_raw = getattr(pyrpc, 'meta_raw', 0)
+    meta_raw = getattr(pyrpc, "meta_raw", 0)
     return (
-        getattr(pyrpc, 'is_capture', False)
-        or pyrpc.type_str == 'capture'
+        getattr(pyrpc, "is_capture", False)
+        or pyrpc.type_str == "capture"
         or (meta_raw & 0x1000) != 0
-        or pyrpc.name.rsplit('.', 1)[-1] == 'capture'
+        or pyrpc.name.rsplit(".", 1)[-1] == "capture"
     )
+
 
 class _RpcNode:
     """Base class for RPCs and surveys in the device tree"""
@@ -249,8 +251,8 @@ class _Rpc(_RpcNode):
         match pyrpc:
             case r if _is_capture_rpc(r):
                 subclass = _RpcCapture
-            case r if r.type_str == '' and r.size_bytes != 0:
-                subclass = _RpcReadWrite # unknown/bytes rpc
+            case r if r.type_str == "" and r.size_bytes != 0:
+                subclass = _RpcReadWrite  # unknown/bytes rpc
             case r if r.readable and r.writable:
                 subclass = _RpcReadWrite
             case r if r.writable:
@@ -265,16 +267,16 @@ class _Rpc(_RpcNode):
     def __init__(self, pyrpc: _twinleaf._Rpc, device: Device):
         super().__init__(pyrpc.name)
         self._device = device
-        self._meta_raw = getattr(pyrpc, 'meta_raw', 0)
+        self._meta_raw = getattr(pyrpc, "meta_raw", 0)
         self._data_size = pyrpc.size_bytes
         self._readable = pyrpc.readable
         self._writable = pyrpc.writable
         self._type: type | None = None
         self._is_capture = _is_capture_rpc(pyrpc)
         match pyrpc.type_str:
-            case 'capture':
+            case "capture":
                 self._data_type = None
-            case t if t.startswith('u'):
+            case t if t.startswith("u"):
                 self._type = int
                 self._data_type = 0
                 self._signed = False
@@ -298,8 +300,8 @@ class _Rpc(_RpcNode):
     def __repr__(self):
         if self._is_capture:
             return f"{self.__module__}.{self.__class__.__name__}('{self.__name__}', capture=True)"
-        ret = super().__repr__().strip(')') + ", "
-        if hasattr(self, '_signed') and not self._signed:
+        ret = super().__repr__().strip(")") + ", "
+        if hasattr(self, "_signed") and not self._signed:
             ret += "u"
         ret += self._type.__name__ if self._type is not None else "none"
         if self._data_size:  # is not 0 or None
@@ -307,7 +309,7 @@ class _Rpc(_RpcNode):
         ret += ")"
         return ret
 
-    def _call(self, arg: _rpc_type=None, *, raw: bool=False) -> _rpc_type:
+    def _call(self, arg: _rpc_type = None, *, raw: bool = False) -> _rpc_type:
         if self._is_capture:
             if arg is None:
                 return self._device._capture(self.__name__, 5.0, raw)
@@ -349,11 +351,13 @@ class _Rpc(_RpcNode):
 
 
 class _RpcReadOnly(_Rpc):
-    def __call__(self, timeout: float | None = None, *, raw: bool=False):
+    def __call__(self, timeout: float | None = None, *, raw: bool = False):
         if self._is_capture:
             return self._call(timeout, raw=raw)
         if timeout is not None or raw:
-            raise TypeError(f"{self.__name__} is read-only and does not accept an argument")
+            raise TypeError(
+                f"{self.__name__} is read-only and does not accept an argument"
+            )
         return self._call()
 
 
@@ -376,8 +380,9 @@ class _RpcCapture(_Rpc):
     def __repr__(self):
         return f"{self.__module__}.{self.__class__.__name__}('{self.__name__}', capture=True)"
 
-    def __call__(self, timeout: float = 5.0, *, raw: bool=False) -> dict:
+    def __call__(self, timeout: float = 5.0, *, raw: bool = False) -> dict:
         return self._device._capture(self.__name__, timeout, raw)
+
 
 # Samples classes
 class _SamplesBase:
