@@ -36,3 +36,12 @@ build-backend = "maturin"
 features = ["pyo3/extension-module"]
 module-name = "twinleaf._twinleaf"
 python-source = "python"
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+exclude = ["examples"]

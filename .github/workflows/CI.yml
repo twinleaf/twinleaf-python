@@ -19,6 +19,20 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
+      - name: Ruff lint
+        run: uvx ruff@0.15.10 check
+      - name: Ruff format
+        run: uvx ruff@0.15.10 format --check
+      - name: Type check (ty)
+        run: uvx --with ipython ty@0.0.30 check
+
   linux:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
@@ -26,19 +40,11 @@ jobs:
         platform:
           - runner: ubuntu-latest
             target: x86_64
-          - runner: ubuntu-latest
-            target: x86
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
             target: aarch64
-          - runner: ubuntu-latest
-            target: armv7
-          - runner: ubuntu-latest
-            target: s390x
-          - runner: ubuntu-latest
-            target: ppc64le
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: 3.x
       - name: Build wheels
@@ -48,6 +54,10 @@ jobs:
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
+          before-script-linux: |
+            if command -v yum >/dev/null; then yum install -y systemd-devel; fi
+            if command -v apt-get >/dev/null; then apt-get update && apt-get install -y libudev-dev; fi
+            if command -v apk >/dev/null; then apk add --no-cache eudev-dev; fi
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -61,15 +71,11 @@ jobs:
         platform:
           - runner: ubuntu-latest
             target: x86_64
-          - runner: ubuntu-latest
-            target: x86
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
             target: aarch64
-          - runner: ubuntu-latest
-            target: armv7
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: 3.x
       - name: Build wheels
@@ -79,6 +85,10 @@ jobs:
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: musllinux_1_2
+          before-script-linux: |
+            if command -v yum >/dev/null; then yum install -y systemd-devel; fi
+            if command -v apt-get >/dev/null; then apt-get update && apt-get install -y libudev-dev; fi
+            if command -v apk >/dev/null; then apk add --no-cache eudev-dev; fi
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -95,8 +105,8 @@ jobs:
           - runner: windows-latest
             target: x86
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: 3.x
           architecture: ${{ matrix.platform.target }}
@@ -122,8 +132,8 @@ jobs:
           - runner: macos-latest
             target: x86_64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: 3.x
       - name: Build wheels
@@ -141,7 +151,7 @@ jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
@@ -157,7 +167,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
-    needs: [linux, musllinux, windows, macos, sdist]
+    needs: [lint, linux, musllinux, windows, macos, sdist]
     permissions:
       # Use to sign the release artifacts
       id-token: write
