@@ -1,6 +1,6 @@
 [package]
 name = "twinleaf-python"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 
 [lib]
@@ -9,5 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.28", features = ["extension-module"] }
-twinleaf = { path = "../../twinleaf-rust/twinleaf" }
+twinleaf = { version = "1.9" }
 crossbeam = "0.8"
