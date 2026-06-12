@@ -11,11 +11,11 @@ This package implements a communications protocol to work with [Twinleaf sensors
 
 ## Installation
 
-Common platforms are support installation from PyPI using:
+Common platforms support installation from PyPI using:
 
     `pip install twinleaf`
 
-## Programming
+## Use
 
 Examples of basic usage can be found in the `examples` directory.
 
@@ -68,6 +68,4 @@ Windows console scripts are installed in an odd folder which may be added to you
 
 ## Development
 
-Ensure the rust compiler is installed. Use `pip install -e .` to build the package.
-
-
+Ensure the rust compiler is installed. Use `pip install -e .` to build the package. Publish to PyPI via CI/CD by setting a tag with the version number.
