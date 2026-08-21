@@ -142,6 +142,61 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      # The two steps below are hand-written; `maturin generate-ci github` will
+      # drop them if the workflow is ever regenerated. macOS 27's dyld refuses to
+      # load a Mach-O whose LINKEDIT string pool is not 8-byte aligned, and a
+      # wheel can carry that defect off a runner that loads it happily.
+      - name: Check LINKEDIT alignment
+        run: |
+          python3 - dist/*.whl <<'PY'
+          import struct, sys, zipfile
+
+          def slices(buf):
+              magic, = struct.unpack_from(">I", buf, 0)
+              if magic in (0xCAFEBABE, 0xCAFEBABF):          # universal binary
+                  nfat, = struct.unpack_from(">I", buf, 4)
+                  step, fmt = (32, ">2I2Q") if magic == 0xCAFEBABF else (20, ">5I")
+                  for i in range(nfat):
+                      yield buf[struct.unpack_from(fmt, buf, 8 + i * step)[2]:]
+              else:
+                  yield buf
+
+          def string_pool_offset(sl):
+              if struct.unpack_from("<I", sl, 0)[0] != 0xFEEDFACF:
+                  return None                                # not 64-bit little-endian Mach-O
+              ncmds, = struct.unpack_from("<I", sl, 16)
+              pos = 32
+              for _ in range(ncmds):
+                  cmd, size = struct.unpack_from("<2I", sl, pos)
+                  if cmd == 0x2:                             # LC_SYMTAB
+                      return struct.unpack_from("<4I", sl, pos + 8)[2]
+                  pos += size
+              return None
+
+          bad = checked = 0
+          for wheel in sys.argv[1:]:
+              with zipfile.ZipFile(wheel) as whl:
+                  for name in (n for n in whl.namelist() if n.endswith(".so")):
+                      for sl in slices(whl.read(name)):
+                          off = string_pool_offset(sl)
+                          if off is None:
+                              continue
+                          checked += 1
+                          bad += off % 8 != 0
+                          state = "ok" if off % 8 == 0 else "MIS-ALIGNED"
+                          print(f"{state:>11}  {name}  string pool at 0x{off:X}")
+          if bad:
+              sys.exit(f"{bad} mis-aligned LINKEDIT string pool(s); macOS 27 will refuse to load these")
+          if not checked:
+              sys.exit("no Mach-O extension modules found to check")
+          print(f"all {checked} extension module(s) 8-byte aligned")
+          PY
+      - name: Import the built wheel
+        # macos-latest runners are arm64, so only the native wheel is loadable here.
+        if: matrix.platform.target == 'aarch64'
+        run: |
+          python -m pip install --force-reinstall --no-deps --no-index --find-links dist twinleaf
+          python -c "import twinleaf; print(twinleaf.__file__)"
       - name: Upload wheels
         uses: actions/upload-artifact@v7
         with:
