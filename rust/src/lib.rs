@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ::twinleaf::tio::*;
 use ::twinleaf::*;
@@ -8,10 +8,69 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 
 #[pyclass(name = "_DataIterator", subclass)]
 struct PyIter {
-    port: device::Device,
+    tree: device::DeviceTree,
     n: Option<usize>,
     stream: String,
     columns: Vec<String>,
+    /// Batch currently being drained, one row per `__next__` call.
+    batch: Option<data::SampleBatch>,
+    row: usize,
+    /// Which of the batch's schema columns pass the column filter.
+    matched: Vec<bool>,
+}
+
+fn column_mask(schema: &[data::Series], filters: &[String]) -> Vec<bool> {
+    schema
+        .iter()
+        .map(|series| {
+            let name = &series.metadata().name;
+            filters.is_empty()
+                || filters.iter().any(|c| {
+                    if let Some(prefix) = c.strip_suffix('*') {
+                        name.starts_with(prefix)
+                    } else {
+                        c == name
+                    }
+                })
+        })
+        .collect()
+}
+
+impl PyIter {
+    /// Block until a batch for the requested stream arrives. The GIL is
+    /// released while waiting so other Python threads keep running, and
+    /// signals are checked on every wakeup (at least every 100ms) so Ctrl-C
+    /// interrupts the wait even when filtered-out batches keep arriving.
+    fn wait_batch(&mut self, py: Python<'_>) -> PyResult<data::SampleBatch> {
+        loop {
+            py.check_signals()?;
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let tree = &mut self.tree;
+            match py.detach(move || tree.recv_deadline(deadline)) {
+                Ok(device::TreeItem::Batch(batch)) => {
+                    if self.stream.is_empty() || self.stream == batch.stream().name {
+                        return Ok(batch);
+                    }
+                }
+                Ok(device::TreeItem::Event(device::TreeEvent::Device {
+                    event: device::DeviceEvent::Status(status),
+                    ..
+                })) => match status {
+                    proto::ProxyStatus::FailedToConnect | proto::ProxyStatus::FailedToReconnect => {
+                        return Err(PyRuntimeError::new_err("failed to connect to device"))
+                    }
+                    // A transient disconnect resolves as a reconnect, which
+                    // surfaces as a boundary on the next batch.
+                    _ => {}
+                },
+                Ok(device::TreeItem::Event(_)) => {}
+                Err(proxy::RecvTimeoutError::Timeout) => {}
+                Err(proxy::RecvTimeoutError::ProxyDisconnected) => {
+                    return Err(PyRuntimeError::new_err("proxy connection closed"))
+                }
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -21,64 +80,50 @@ impl PyIter {
     }
 
     fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
-        let dict = PyDict::new(slf.py());
+        let py = slf.py();
+        py.check_signals()?;
 
-        // Check if we have a finite count and if it's reached zero
-        if let Some(ctr) = slf.n {
-            if ctr == 0 {
-                // TODO: drop port
-                return Ok(None);
-            } else {
-                slf.n = Some(ctr - 1);
-            }
+        if slf.n == Some(0) {
+            return Ok(None);
         }
-        // If n is None, we continue indefinitely
 
-        while dict.is_empty() {
-            // Check for keyboard interrupt
-            slf.py().check_signals()?;
+        let this = &mut *slf;
+        loop {
+            // Drain the buffered batch; skip it entirely if no column matches.
+            if let Some(batch) = &this.batch {
+                if this.row < batch.len() && this.matched.iter().any(|&m| m) {
+                    let row = this.row;
+                    this.row += 1;
 
-            let sample = match slf.port.next() {
-                Ok(sample) => sample,
-                Err(_) => return Ok(None), // End of stream or error
-            };
-            if !slf.stream.is_empty() && slf.stream != sample.stream.name {
-                continue;
-            }
-
-            for sample_column in &sample.columns {
-                let sample_column_name = sample_column.desc.name.clone();
-                let column_matches = slf.columns.is_empty() || slf.columns.iter().any(|c| {
-                    if c.ends_with("*") {
-                        // Remove * and check if sample_column_name starts with prefix
-                        let prefix = &c[..c.len()-1];
-                        sample_column_name.starts_with(prefix)
-                    } else {
-                        c.eq(&sample_column_name)
+                    let dict = PyDict::new(py);
+                    dict.set_item("stream", batch.stream().stream_id)?;
+                    dict.set_item("time", batch.timestamps()[row])?;
+                    for (series, matched) in
+                        batch.schema().iter().zip(this.matched.iter().copied())
+                    {
+                        if !matched {
+                            continue;
+                        }
+                        let name = series.metadata().name.as_str();
+                        match series.values().get(row) {
+                            data::ColumnData::Int(x) => dict.set_item(name, x)?,
+                            data::ColumnData::UInt(x) => dict.set_item(name, x)?,
+                            data::ColumnData::Float(x) => dict.set_item(name, x)?,
+                            _ => dict.set_item(name, "UNKNOWN")?,
+                        }
                     }
-                });
-                if column_matches {
-                    let time = sample.timestamp_end().into_pyobject(slf.py())?;
-                    let stream_id = sample.stream.stream_id.into_pyobject(slf.py())?;
-                    dict.set_item("stream", stream_id)?;
-                    dict.set_item("time", time)?;
-                    match sample_column.value {
-                        data::ColumnData::Int(x) => {
-                            dict.set_item(sample_column_name.into_pyobject(slf.py())?, x.into_pyobject(slf.py())?)?
-                        }
-                        data::ColumnData::UInt(x) => {
-                            dict.set_item(sample_column_name.into_pyobject(slf.py())?, x.into_pyobject(slf.py())?)?
-                        }
-                        data::ColumnData::Float(x) => {
-                            dict.set_item(sample_column_name.into_pyobject(slf.py())?, x.into_pyobject(slf.py())?)?
-                        }
-                        _ => dict.set_item(sample_column_name.into_pyobject(slf.py())?, "UNKNOWN".into_pyobject(slf.py())?)?,
-                    };
+                    if let Some(ctr) = this.n {
+                        this.n = Some(ctr - 1);
+                    }
+                    return Ok(Some(dict.into()));
                 }
             }
-        }
 
-        Ok(Some(dict.into()))
+            let batch = this.wait_batch(py)?;
+            this.matched = column_mask(batch.schema(), &this.columns);
+            this.row = 0;
+            this.batch = Some(batch);
+        }
     }
 }
 
@@ -100,7 +145,7 @@ impl PyRpc {
         self.inner
             .meta
             .flags()
-            .contains(device::RpcMetaFlags::READABLE)
+            .contains(proto::RpcMetaFlags::READABLE)
     }
 
     #[getter]
@@ -108,7 +153,7 @@ impl PyRpc {
         self.inner
             .meta
             .flags()
-            .contains(device::RpcMetaFlags::WRITABLE)
+            .contains(proto::RpcMetaFlags::WRITABLE)
     }
 
     #[getter]
@@ -126,7 +171,7 @@ impl PyRpc {
         self.inner
             .meta
             .flags()
-            .contains(device::RpcMetaFlags::CAPTURE)
+            .contains(proto::RpcMetaFlags::CAPTURE)
     }
 
     #[getter]
@@ -204,12 +249,15 @@ impl PyDevice {
             "tcp://localhost".to_string()
         };
         let route = if let Some(path) = route {
-            proto::DeviceRoute::from_str(&path).unwrap()
+            path.parse::<proto::DeviceRoute>().map_err(|e| {
+                PyValueError::new_err(format!("invalid device route '{}': {}", path, e))
+            })?
         } else {
             proto::DeviceRoute::root()
         };
         let proxy = proxy::Interface::new(&root);
-        let rpc = device::RpcClient::open(&proxy, route.clone()).unwrap();
+        let rpc = device::RpcClient::open(&proxy, route)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to open device: {}", e)))?;
         Ok(PyDevice { root, proxy, route, rpc })
     }
 
@@ -279,53 +327,53 @@ impl PyDevice {
     }
 
     fn _rpc_list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let port = self
-            .proxy
-            .subtree_rpc(self.route.clone())
+        let registry = self
+            .rpc
+            .registry(&self.route)
             .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let specs = device::util::load_rpc_specs(&port)
-            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let list: Vec<_> = specs
-            .into_iter()
-            .map(|spec| (spec.full_name, spec.meta.bits()))
+        let list: Vec<_> = registry
+            .iter()
+            .map(|desc| (desc.full_name.clone(), desc.meta.bits()))
             .collect();
-        Ok(PyList::new(py, list)?)
+        PyList::new(py, list)
     }
 
     fn _rpc_registry(&self) -> PyResult<PyRegistry> {
-        let port = self
-            .proxy
-            .subtree_rpc(self.route.clone())
-            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let specs = device::util::load_rpc_specs(&port)
-            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let hash = self
+        let registry = self
             .rpc
-            .get(&self.route, "rpc.hash")
+            .registry(&self.route)
             .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let mut registry = device::RpcRegistry::new(specs);
-        registry.hash = Some(hash);
         Ok(PyRegistry { inner: registry })
     }
 
     #[pyo3(signature = (n=None, stream=None, columns=None))]
-    fn _samples<'py>(
+    fn _samples(
         &self,
-        _py: Python<'py>,
         n: Option<usize>,
         stream: Option<String>,
         columns: Option<Vec<String>>,
     ) -> PyResult<PyIter> {
+        let port = self
+            .proxy
+            .device_full(self.route)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to open device: {}", e)))?;
         Ok(PyIter {
-            port: device::Device::new(self.proxy.device_full(self.route.clone()).unwrap()),
-            n: n,
+            tree: device::DeviceTree::new(port, proto::DeviceRoute::root()),
+            n,
             stream: stream.unwrap_or_default(),
             columns: columns.unwrap_or_default(),
+            batch: None,
+            row: 0,
+            matched: Vec::new(),
         })
     }
 
     fn _get_metadata<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let mut device = device::Device::new(self.proxy.device_full(self.route.clone()).unwrap());
+        let port = self
+            .proxy
+            .device_full(self.route)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to open device: {}", e)))?;
+        let mut device = device::Device::new(port);
         let meta = match device.get_metadata() {
             Ok(meta) => meta,
             Err(_) => return Err(PyRuntimeError::new_err("Failed to get metadata")),
@@ -372,6 +420,8 @@ impl PyDevice {
 /// import the module.
 #[pymodule]
 fn _twinleaf(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Route the twinleaf crate's `log` output to Python's logging module.
+    pyo3_log::init();
     m.add_class::<PyDevice>()?;
     m.add_class::<PyRpc>()?;
     m.add_class::<PyRegistry>()?;
