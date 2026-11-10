@@ -22,6 +22,7 @@ license-files = [
 dynamic = ["version"]
 dependencies = [
     "ipython>=9",
+    "numpy>=1.26",
 ]
 readme="README.md"
 

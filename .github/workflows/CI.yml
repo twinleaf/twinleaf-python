@@ -31,7 +31,7 @@ jobs:
       - name: Ruff format
         run: uvx ruff@0.15.10 format --check
       - name: Type check (ty)
-        run: uvx --with ipython ty@0.0.30 check
+        run: uvx --with ipython --with numpy ty@0.0.30 check
 
   linux:
     runs-on: ${{ matrix.platform.runner }}
