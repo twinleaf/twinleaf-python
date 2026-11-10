@@ -48,6 +48,13 @@ Every connection goes through a proxy on `localhost:7855`, which shares each dev
 
     cargo install twinleaf-tools
 
+If the proxy stops, reading samples raises `ConnectionError`. If the proxy's process ends abruptly, such as a script that hosted it exiting, the connection spends up to 30 s trying to reconnect before it raises. While samples are being read, `twinleaf.DeviceLostWarning` reports a device that stops responding, and `twinleaf.SampleLossWarning` reports samples lost because the reader fell behind or the device or its link dropped them. Both are Python warnings, so they can be silenced or raised as errors:
+
+```python
+import warnings, twinleaf
+warnings.simplefilter("error", twinleaf.SampleLossWarning)
+```
+
 This package requires `twinleaf-tools` 2.0 or later. It cannot connect to a proxy from an older version, such as the 1.x `tio-proxy` command. Stop any older proxy before connecting.
 
 

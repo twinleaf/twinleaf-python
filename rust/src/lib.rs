@@ -1,21 +1,48 @@
+use std::ffi::CString;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ::twinleaf::data::{ColumnData, SampleBatch};
 use ::twinleaf::device::rpc::{RpcDescriptor, RpcMetaExt, RpcMetaFlags, RpcRegistry};
-use ::twinleaf::device::{Connection, Device, RecvError, Receiver};
+use ::twinleaf::device::{Connection, Device, Presence, RecvError, Receiver};
 use ::twinleaf::proto::DeviceRoute;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyRuntimeWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::PyTypeInfo;
 
 /// How long a blocked `__next__` waits before it checks for Ctrl-C.
 const SIGNAL_POLL: Duration = Duration::from_millis(100);
 
+pyo3::create_exception!(
+    twinleaf,
+    SampleLossWarning,
+    PyRuntimeWarning,
+    "Samples of a stream were lost between two rows, because the reader fell behind or the device or its link dropped them."
+);
+pyo3::create_exception!(
+    twinleaf,
+    DeviceLostWarning,
+    PyRuntimeWarning,
+    "The device stopped responding while waiting for samples. The connection keeps trying to reach it."
+);
+
+/// Issues a Python warning of category `T`. Fails if a warnings filter turns
+/// it into an error.
+fn warn<T: PyTypeInfo>(py: Python<'_>, message: String) -> PyResult<()> {
+    let message = CString::new(message.replace('\0', " ")).expect("NUL bytes were replaced");
+    PyErr::warn(py, py.get_type::<T>().as_any(), &message, 1)
+}
+
 #[pyclass(name = "_DataIterator", subclass)]
 struct PyIter {
     receiver: Receiver<SampleBatch>,
+    /// Whether the device is there, as the proxy follows it.
+    presence: Receiver<Presence>,
+    /// Whether a `DeviceLostWarning` was issued since the device last sent data.
+    device_lost: bool,
+    route: String,
     /// The batch being read, and the next row of it to read.
     batch: Option<SampleBatch>,
     row: usize,
@@ -25,6 +52,57 @@ struct PyIter {
 }
 
 impl PyIter {
+    /// Warns once when the proxy reports the device lost. Called while no
+    /// batch arrives, so a lost device does not go unnoticed during the time
+    /// the connection spends reconnecting.
+    fn watch_presence(&mut self, py: Python<'_>) -> PyResult<()> {
+        loop {
+            match self.presence.try_recv() {
+                Ok(Some(Presence::Lost { since })) => {
+                    if !self.device_lost {
+                        self.device_lost = true;
+                        warn::<DeviceLostWarning>(
+                            py,
+                            format!(
+                                "the device at {} stopped responding {:.1} s ago; waiting for it to reconnect",
+                                self.route,
+                                since.elapsed().as_secs_f64()
+                            ),
+                        )?;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Err(RecvError::Lagged(_)) => {}
+                // No change pending. An ended connection is reported by the
+                // sample receiver.
+                Ok(None) | Err(_) => return Ok(()),
+            }
+        }
+    }
+
+    /// Warns if samples of the batch's stream were lost before it.
+    fn warn_loss(&self, py: Python<'_>, batch: &SampleBatch) -> PyResult<()> {
+        let Some(loss) = batch.boundary().and_then(|b| b.loss.as_ref()) else {
+            return Ok(());
+        };
+        let cause = if loss.dropped_batches > 0 {
+            format!(
+                "this reader fell behind, and {} batches were dropped from its queue",
+                loss.dropped_batches
+            )
+        } else {
+            "the device or its link dropped them".to_string()
+        };
+        warn::<SampleLossWarning>(
+            py,
+            format!(
+                "stream '{}' lost {} samples: {cause}",
+                batch.schema().stream().name(),
+                loss.samples
+            ),
+        )
+    }
+
     fn column_matches(&self, name: &str) -> bool {
         self.columns.is_empty()
             || self.columns.iter().any(|c| {
@@ -57,8 +135,8 @@ impl PyIter {
         Ok(if dict.is_empty() { None } else { Some(dict.unbind()) })
     }
 
-    /// Returns the next row that has a matching column, or `None` at the end
-    /// of the stream.
+    /// Returns the next row that has a matching column. Raises
+    /// `ConnectionError` if the connection to the proxy ends.
     fn next_dict(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
         loop {
             if let Some(batch) = self.batch.take() {
@@ -78,15 +156,34 @@ impl PyIter {
                 let receiver = &self.receiver;
                 match py.detach(|| receiver.recv_timeout(SIGNAL_POLL)) {
                     Ok(batch) => break batch,
-                    Err(RecvError::Timeout) | Err(RecvError::Lagged(_)) => continue,
-                    Err(_) => return Ok(None), // End of stream
+                    Err(RecvError::Timeout) => self.watch_presence(py)?,
+                    // The next batch of each stream that lost batches names
+                    // the loss, and warn_loss reports it.
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Stopped) => {
+                        return Err(PyConnectionError::new_err(format!(
+                            "the tio proxy stopped, which ended the samples from {}",
+                            self.route
+                        )))
+                    }
+                    Err(error) => {
+                        return Err(PyConnectionError::new_err(format!(
+                            "lost the connection to the tio proxy, which ended the samples from {}: {error}",
+                            self.route
+                        )))
+                    }
                 }
             };
+            // Data is arriving, so the device is there again.
+            self.device_lost = false;
             if !self.stream.is_empty() && self.stream != batch.schema().stream().name() {
                 continue;
             }
-            self.batch = Some(batch);
+            // Keep the batch before warning, so iteration can resume if a
+            // warnings filter raises the warning as an error.
+            self.batch = Some(batch.clone());
             self.row = 0;
+            self.warn_loss(py, &batch)?;
         }
     }
 }
@@ -253,7 +350,7 @@ impl PyDevice {
     fn load_registry(&self, py: Python<'_>) -> PyResult<Arc<RpcRegistry>> {
         let device = &self.device;
         py.detach(|| device.rpc_registry())
-            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to load the RPC table: {e}")))
     }
 }
 
@@ -290,7 +387,7 @@ impl PyDevice {
         let device = &self.device;
         match py.detach(|| device.raw_rpc(name, req)) {
             Ok(ret) => Ok(PyBytes::new(py, &ret[..])),
-            _ => Err(PyRuntimeError::new_err(format!("RPC '{}' failed", name))),
+            Err(error) => Err(PyRuntimeError::new_err(format!("RPC '{name}' failed: {error}"))),
         }
     }
 
@@ -369,6 +466,9 @@ impl PyDevice {
     ) -> PyResult<PyIter> {
         Ok(PyIter {
             receiver: self.device.samples(),
+            presence: self.device.presence_updates(),
+            device_lost: false,
+            route: self.route.to_string(),
             batch: None,
             row: 0,
             n,
@@ -381,7 +481,9 @@ impl PyDevice {
         let device = &self.device;
         let meta = match py.detach(|| device.metadata()) {
             Ok(meta) => meta,
-            Err(_) => return Err(PyRuntimeError::new_err("Failed to get metadata")),
+            Err(error) => {
+                return Err(PyRuntimeError::new_err(format!("Failed to get metadata: {error}")))
+            }
         };
 
         let dict = PyDict::new(py);
@@ -430,5 +532,7 @@ fn _twinleaf(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
     m.add_class::<PyRpc>()?;
     m.add_class::<PyRegistry>()?;
+    m.add("SampleLossWarning", m.py().get_type::<SampleLossWarning>())?;
+    m.add("DeviceLostWarning", m.py().get_type::<DeviceLostWarning>())?;
     Ok(())
 }

@@ -7,6 +7,12 @@ Mirrors the pyo3 bindings in rust/src/lib.rs. Keep in sync with the
 from collections.abc import Iterator
 from typing import Any
 
+class SampleLossWarning(RuntimeWarning):
+    """Samples of a stream were lost between two rows."""
+
+class DeviceLostWarning(RuntimeWarning):
+    """The device stopped responding while waiting for samples."""
+
 class _Rpc:
     @property
     def name(self) -> str: ...

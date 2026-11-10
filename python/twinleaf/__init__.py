@@ -1,4 +1,6 @@
 from twinleaf import _twinleaf
+from twinleaf._twinleaf import DeviceLostWarning as DeviceLostWarning
+from twinleaf._twinleaf import SampleLossWarning as SampleLossWarning
 
 
 class Device(_twinleaf._Device):
