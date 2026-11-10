@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ::twinleaf::data::{ColumnData, DataType, SampleBatch};
+use ::twinleaf::data::{ColumnData, SampleBatch};
 use ::twinleaf::device::rpc::{RpcDescriptor, RpcMetaExt, RpcMetaFlags, RpcRegistry};
 use ::twinleaf::device::{Connection, Device, RecvError, Receiver};
 use ::twinleaf::proto::DeviceRoute;
@@ -86,26 +86,6 @@ impl PyIter {
             self.batch = Some(batch);
             self.row = 0;
         }
-    }
-}
-
-/// The name of a column's data type in the metadata dict, as earlier releases
-/// spelled it, so the dict's contents do not change with the crate version.
-fn data_type_name(data_type: DataType) -> String {
-    match data_type {
-        DataType::U8 => "UInt8".to_string(),
-        DataType::I8 => "Int8".to_string(),
-        DataType::U16 => "UInt16".to_string(),
-        DataType::I16 => "Int16".to_string(),
-        DataType::U24 => "UInt24".to_string(),
-        DataType::I24 => "Int24".to_string(),
-        DataType::U32 => "UInt32".to_string(),
-        DataType::I32 => "Int32".to_string(),
-        DataType::U64 => "UInt64".to_string(),
-        DataType::I64 => "Int64".to_string(),
-        DataType::F32 => "Float32".to_string(),
-        DataType::F64 => "Float64".to_string(),
-        other => format!("Unknown({})", other.value()),
     }
 }
 
@@ -418,7 +398,7 @@ impl PyDevice {
                 let col_dict = PyDict::new(py);
                 col_dict.set_item("name", col.name())?;
                 col_dict.set_item("description", col.description())?;
-                col_dict.set_item("type", data_type_name(col.data_type()))?;
+                col_dict.set_item("type", col.data_type().to_string())?;
                 col_dict.set_item("units", col.units())?;
 
                 columns_dict.set_item(col.name(), col_dict)?;
