@@ -66,6 +66,21 @@ for device in tree:
 
 The devices of a tree share one connection. `twinleaf.Device(url, route)` also reuses the tree for that `url`, so opening several devices on one port costs one connection. `twinleaf.connect([url1, url2])` mounts several devices as one tree at `/0`, `/1`, …. Discovery listens for two seconds; `tree.refresh()` looks again.
 
+### Several devices of one kind
+
+`tree.unify(name)` addresses every device with that `dev.name` as one, like the Twinleaf app's "Unify Matching Sensors":
+
+```python
+vmrs = tree.unify('VMR')                    # or tree.unify(['/0', '/1'])
+vmrs.settings.vector.data.decimation(8)     # writes to every VMR
+vmrs.settings.vector.data.decimation()      # 8 if every VMR agrees, else
+                                            # twinleaf.Mixed({'/0': 8, '/1': 4})
+vmrs.settings.vector.data()                 # a survey, with Mixed values where they differ
+vmrs.samples(5, ['vector'])                 # the same 5 s of every VMR's vector stream
+```
+
+The unified settings are the RPCs that every device has with the same type; `vmrs.not_shared` lists the rest. A call is tried on every device. If it fails on some of them, `twinleaf.UnifiedRpcError` is raised, holding the replies and errors by route.
+
 ### Synchronized data from several devices
 
 Samples read from two devices with separate `samples(n)` calls cover different time intervals. To get the same interval from several streams, read them from the tree:

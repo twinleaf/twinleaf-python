@@ -1,6 +1,6 @@
 import weakref
 from collections.abc import Iterator, Sequence
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from twinleaf import _twinleaf
 from twinleaf._acquisition import Acquisition as Acquisition
@@ -378,6 +378,10 @@ class _Rpc(_RpcNode):
                     f"Invalid RPC type {other}, RPC types must be {_rpc_type}"
                 )
 
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Calls the RPC; each kind of RPC defines its arguments."""
+        raise NotImplementedError
+
 
 class _RpcReadOnly(_Rpc):
     def __call__(self, timeout: float | None = None, *, raw: bool = False):
@@ -619,6 +623,21 @@ class Tree:
             acq.wait(seconds, timeout=timeout)
             return acq.window(seconds, allow_mixed_timebases=allow_mixed_timebases)
 
+    def unify(self, devices: str | Sequence[str | Device]) -> "Unified":
+        """Returns several devices addressed as one: every device whose
+        `dev.name` is `devices`, such as "VMR", or the devices or routes
+        listed."""
+        if isinstance(devices, str):
+            members = self.find(name=devices)
+            if not members:
+                names = sorted({info.name for info in self.info if info.name})
+                raise KeyError(
+                    f"no device named '{devices}' in {self.url}; names found: {names}"
+                )
+        else:
+            members = [d if isinstance(d, Device) else self[d] for d in devices]
+        return Unified(members)
+
     def __repr__(self) -> str:
         lines = [f"{self.__module__}.{self.__class__.__name__}('{self.url}')"]
         width = max((len(info.route) for info in self.info), default=0)
@@ -635,3 +654,234 @@ class Tree:
 
 def _route_sort_key(route: str) -> tuple[int, ...]:
     return tuple(int(hop) for hop in route.strip("/").split("/") if hop)
+
+
+# Unified devices: several devices of one kind, addressed as one
+class Mixed(dict):
+    """The values of an RPC when the unified devices disagree, keyed by route."""
+
+    def __repr__(self) -> str:
+        return f"twinleaf.Mixed({dict.__repr__(self)})"
+
+
+class UnifiedRpcError(RuntimeError):
+    """An RPC failed on some of the unified devices. It was tried on every
+    device; `results` holds the replies, and `errors` the failures, by route."""
+
+    def __init__(
+        self, message: str, results: dict[str, Any], errors: dict[str, Exception]
+    ):
+        super().__init__(message)
+        self.results = results
+        self.errors = errors
+
+
+def _same(a: Any, b: Any) -> bool:
+    if isinstance(a, float) and isinstance(b, float) and a != a and b != b:
+        return True  # both NaN
+    return type(a) is type(b) and a == b
+
+
+def _combine(results: dict[str, Any]) -> Any:
+    """One value when every device agrees, or else a Mixed mapping."""
+    values = list(results.values())
+    if all(_same(values[0], value) for value in values[1:]):
+        return values[0]
+    return Mixed(results)
+
+
+class _UnifiedNode(_RpcNode):
+    """A node of a unified settings tree."""
+
+    def _survey(self) -> dict[str, Any]:
+        results = {}
+        for attr in self.__dict__.values():
+            if isinstance(attr, _UnifiedRpc):
+                first = attr._first
+                if (
+                    first._readable
+                    and first._type not in {None, bytes}
+                    and not first._is_capture
+                ):
+                    results[attr.__name__] = attr()
+            if isinstance(attr, _UnifiedNode):
+                results |= attr._survey()
+        return results
+
+
+class _UnifiedSurvey(_UnifiedNode):
+    """A branch of a unified settings tree. Calling it reads every readable
+    setting below it from every device."""
+
+    def __call__(self) -> dict[str, Any]:
+        return self._survey()
+
+
+class _UnifiedRpc(_UnifiedNode):
+    """One RPC of every unified device. It takes the same arguments as the
+    RPC of one device, calls it on each, and returns the one value they all
+    agree on, or a `Mixed` mapping of route to value when they differ.
+    Captures return a dict of route to capture."""
+
+    def __init__(self, name: str, members: list[tuple[str, "_Rpc"]]):
+        super().__init__(name)
+        self._members = members
+        self._first = members[0][1]
+
+    def __repr__(self) -> str:
+        detail = repr(self._first).split("(", 1)[1].rstrip(")")
+        routes = [route for route, _ in self._members]
+        return (
+            f"{self.__module__}.{self.__class__.__name__}({detail}, devices={routes})"
+        )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        results: dict[str, Any] = {}
+        errors: dict[str, Exception] = {}
+        for route, rpc in self._members:
+            try:
+                results[route] = rpc(*args, **kwargs)
+            # Every device is tried; failures are raised together afterwards.
+            except Exception as error:
+                errors[route] = error
+        if errors:
+            first = next(iter(errors.values()))
+            if not results and all(
+                type(error) is type(first) and str(error) == str(first)
+                for error in errors.values()
+            ):
+                # The same failure everywhere, such as an argument of the wrong
+                # type: it is not about any one device.
+                raise first
+            failed = "; ".join(f"{route}: {error}" for route, error in errors.items())
+            done = f"; it succeeded on {', '.join(results)}" if results else ""
+            raise UnifiedRpcError(
+                f"{self.__name__} failed on {failed}{done}", results, errors
+            )
+        if isinstance(self._first, _RpcAction):
+            return None
+        if self._first._is_capture:
+            return results
+        return _combine(results)
+
+
+class Unified:
+    """Several devices of one kind, addressed as one, like the Twinleaf
+    app's "Unify Matching Sensors".
+
+    Use `tree.unify("VMR")` to get one. `settings` holds the RPCs every
+    device has, with the same type: calling one reads or writes it on every
+    device. `samples()` reads the same interval of each device's streams.
+    """
+
+    def __init__(self, devices: Sequence[Device]):
+        if not devices:
+            raise ValueError("unify needs at least one device")
+        devices = sorted(devices, key=lambda d: _route_sort_key(d._route))
+        trees = {id(device.tree) for device in devices}
+        if len(trees) != 1:
+            raise ValueError("unified devices must belong to one tree")
+        self.tree: Tree = devices[0].tree
+        self.devices: list[Device] = list(devices)
+        self.settings = _UnifiedSurvey("settings")
+        self.not_shared: list[str] = []
+        self._build_settings()
+
+    @property
+    def routes(self) -> list[str]:
+        """The routes of the unified devices, in order."""
+        return [device._route for device in self.devices]
+
+    def _build_settings(self) -> None:
+        tables = []
+        for device in self.devices:
+            names = device._registry.suggest("")
+            tables.append({name: device._registry.find(name) for name in names})
+        every = set().union(*tables)
+        shared = sorted(
+            name
+            for name in every
+            if all(name in table for table in tables)
+            and len({table[name].meta_raw for table in tables}) == 1
+        )
+        # RPCs some devices lack, or that differ in type or access between
+        # them, cannot be called as one.
+        self.not_shared = sorted(every - set(shared))
+        nodes: dict[str, _UnifiedNode] = {"": self.settings}
+        for name in shared:
+            parent = ""
+            for part in name.split(".")[:-1]:
+                path = f"{parent}.{part}" if parent else part
+                if path not in nodes:
+                    node = _UnifiedSurvey("_rpc" if part == "rpc" else part)
+                    setattr(nodes[parent], "_rpc" if part == "rpc" else part, node)
+                    nodes[path] = node
+                parent = path
+            leaf = name.rsplit(".", 1)[-1]
+            members = [
+                (device._route, _Rpc(table[name], device))
+                for device, table in zip(self.devices, tables)
+            ]
+            rpc = _UnifiedRpc(name, members)
+            existing = nodes.get(name)
+            if existing is not None:
+                # A survey made for longer names already: keep its children.
+                rpc.__dict__.update(
+                    {
+                        k: v
+                        for k, v in existing.__dict__.items()
+                        if isinstance(v, _UnifiedNode)
+                    }
+                )
+            setattr(nodes[parent], "_rpc" if leaf == "rpc" else leaf, rpc)
+            nodes[name] = rpc
+
+    def stream_paths(self, *streams: str) -> list[str]:
+        """The paths of the named streams on every device, such as
+        `["/0/vector", "/1/vector"]` for "vector". With no names, every stream
+        all the devices have."""
+        if not streams:
+            per_device = [
+                set(device._get_metadata()["streams"]) for device in self.devices
+            ]
+            streams = tuple(sorted(set.intersection(*per_device)))
+            if not streams:
+                raise ValueError(
+                    f"the devices at {', '.join(self.routes)} have no stream in "
+                    "common; name the streams to read"
+                )
+        paths = []
+        for device in self.devices:
+            for stream in streams:
+                route = device._route
+                paths.append(f"/{stream}" if route == "/" else f"{route}/{stream}")
+        return paths
+
+    def samples(
+        self,
+        seconds: float,
+        streams: Sequence[str] | None = None,
+        *,
+        timeout: float | None = None,
+        allow_mixed_timebases: bool = False,
+    ) -> Slice:
+        """Reads the same `seconds` of device time from the named streams of
+        every device, such as `samples(5, ["vector"])`, or from every stream
+        they all have. Devices behind different hubs count on different
+        clocks; `allow_mixed_timebases=True` reads each clock's latest window.
+        See `Tree.samples()`."""
+        paths = self.stream_paths(*(streams or ()))
+        return self.tree.samples(
+            seconds, paths, timeout=timeout, allow_mixed_timebases=allow_mixed_timebases
+        )
+
+    def __iter__(self) -> Iterator[Device]:
+        return iter(self.devices)
+
+    def __len__(self) -> int:
+        return len(self.devices)
+
+    def __repr__(self) -> str:
+        members = ", ".join(f"{d._route}" for d in self.devices)
+        noun = "device" if len(self.devices) == 1 else "devices"
+        return f"twinleaf.Unified({len(self.devices)} {noun} at {members})"

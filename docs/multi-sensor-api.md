@@ -1,7 +1,7 @@
 # Proposal: multiple sensors and synchronized data in the Python API
 
-Status: phases 1 (the tree) and 2 (synchronized acquisition) are implemented;
-phases 3 and 4 are a proposal, for review. Written 9 November 2026 against twinleaf 2.0.0 and the VMR-SANDI setup
+Status: phases 1 (the tree), 2 (synchronized acquisition) and 3 (unified
+settings) are implemented; phase 4 is a proposal, for review. Written 9 November 2026 against twinleaf 2.0.0 and the VMR-SANDI setup
 connected on `/dev/cu.usbmodem14201`.
 
 Phase 1 as built:
@@ -70,6 +70,33 @@ Phase 2 as built, with how it differs from section 3 below:
     inside the interval.
   - A 30 s window of all five streams held exactly 6000 / 300 / 120 / 300 / 30
     rows on uniform steps, with no gaps and no dropped batches.
+
+Phase 3 as built, as sketched in section 2 below, plus:
+
+- **Choosing devices:** `tree.unify(name)` takes every device whose `dev.name`
+  matches, ignoring case. `tree.unify([routes or Devices])` takes the devices
+  listed.
+- **Shared RPCs:** the unified settings are the RPCs every member has with an
+  identical `rpc.info` word, so the same type and access. `not_shared` lists
+  the others; for the COMM-USB with the VMR, that is 62 of them.
+- **Calls:** each unified RPC calls the members' own RPC objects with the
+  same arguments, so argument checking is exactly as for one device.
+  - Reads and writes return the common value, or `twinleaf.Mixed`.
+  - Captures return one capture per route.
+  - Actions return None.
+  - Surveys combine per RPC.
+- **Failures:** a failure on some members raises `twinleaf.UnifiedRpcError`, a
+  `RuntimeError`, after every member was tried, with `results` and `errors`
+  by route. The same failure on every member, such as an argument of the
+  wrong type, raises that error itself.
+- **Samples:** `Unified.samples(seconds, ["vector"])` reads the named streams
+  of every member through `Tree.samples`. `stream_paths()` gives their paths.
+  Devices behind different hubs need `allow_mixed_timebases=True`.
+- **Tested:**
+  - On a three-device simulated tree: writes, agreeing and mixed reads,
+    surveys, captures, partial failures and argument errors.
+  - Read-only on the VMR-SANDI: the VMR alone, and the COMM-USB with the VMR,
+    whose shared settings are `dev.*` and `rpc.*` only.
 
 ## What we have to work with
 
