@@ -1,17 +1,129 @@
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use ::twinleaf::tio::*;
-use ::twinleaf::*;
+use ::twinleaf::data::{ColumnData, DataType, SampleBatch};
+use ::twinleaf::device::rpc::{RpcDescriptor, RpcMetaExt, RpcMetaFlags, RpcRegistry};
+use ::twinleaf::device::{Connection, Device, RecvError, Receiver};
+use ::twinleaf::proto::DeviceRoute;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
+/// How long a blocked `__next__` waits before it checks for Ctrl-C.
+const SIGNAL_POLL: Duration = Duration::from_millis(100);
+
 #[pyclass(name = "_DataIterator", subclass)]
 struct PyIter {
-    port: device::Device,
+    receiver: Receiver<SampleBatch>,
+    /// The batch being read, and the next row of it to read.
+    batch: Option<SampleBatch>,
+    row: usize,
     n: Option<usize>,
     stream: String,
     columns: Vec<String>,
+}
+
+impl PyIter {
+    fn column_matches(&self, name: &str) -> bool {
+        self.columns.is_empty()
+            || self.columns.iter().any(|c| {
+                if let Some(prefix) = c.strip_suffix('*') {
+                    name.starts_with(prefix)
+                } else {
+                    c == name
+                }
+            })
+    }
+
+    /// Builds the dict for one row, or `None` if no column of the row matches.
+    fn row_dict(&self, py: Python<'_>, batch: &SampleBatch, row: usize) -> PyResult<Option<Py<PyDict>>> {
+        let Some(sample) = batch.row(row) else {
+            return Ok(None);
+        };
+        let dict = PyDict::new(py);
+        for (column, value) in batch.schema().columns().zip(sample.values()) {
+            let name = column.name();
+            if !self.column_matches(name) {
+                continue;
+            }
+            if dict.is_empty() {
+                let stream_id = batch.schema().stream().stream_id().value();
+                dict.set_item("stream", stream_id)?;
+                dict.set_item("time", sample.timestamp_end())?;
+            }
+            dict.set_item(name, column_value(py, value)?)?;
+        }
+        Ok(if dict.is_empty() { None } else { Some(dict.unbind()) })
+    }
+
+    /// Returns the next row that has a matching column, or `None` at the end
+    /// of the stream.
+    fn next_dict(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        loop {
+            if let Some(batch) = self.batch.take() {
+                while self.row < batch.len() {
+                    let row = self.row;
+                    self.row += 1;
+                    if let Some(dict) = self.row_dict(py, &batch, row)? {
+                        self.batch = Some(batch);
+                        return Ok(Some(dict));
+                    }
+                }
+            }
+
+            let batch = loop {
+                py.check_signals()?;
+                match self.receiver.recv_timeout(SIGNAL_POLL) {
+                    Ok(batch) => break batch,
+                    Err(RecvError::Timeout) | Err(RecvError::Lagged(_)) => continue,
+                    Err(_) => return Ok(None), // End of stream
+                }
+            };
+            if !self.stream.is_empty() && self.stream != batch.schema().stream().name() {
+                continue;
+            }
+            self.batch = Some(batch);
+            self.row = 0;
+        }
+    }
+}
+
+/// The name of a column's data type in the metadata dict, as earlier releases
+/// spelled it, so the dict's contents do not change with the crate version.
+fn data_type_name(data_type: DataType) -> String {
+    match data_type {
+        DataType::U8 => "UInt8".to_string(),
+        DataType::I8 => "Int8".to_string(),
+        DataType::U16 => "UInt16".to_string(),
+        DataType::I16 => "Int16".to_string(),
+        DataType::U24 => "UInt24".to_string(),
+        DataType::I24 => "Int24".to_string(),
+        DataType::U32 => "UInt32".to_string(),
+        DataType::I32 => "Int32".to_string(),
+        DataType::U64 => "UInt64".to_string(),
+        DataType::I64 => "Int64".to_string(),
+        DataType::F32 => "Float32".to_string(),
+        DataType::F64 => "Float64".to_string(),
+        other => format!("Unknown({})", other.value()),
+    }
+}
+
+/// Converts one decoded value to the Python type its column type maps to.
+fn column_value<'py>(py: Python<'py>, value: ColumnData) -> PyResult<Bound<'py, PyAny>> {
+    Ok(match value {
+        ColumnData::I8(x) => x.into_pyobject(py)?.into_any(),
+        ColumnData::I16(x) => x.into_pyobject(py)?.into_any(),
+        ColumnData::I32(x) => x.into_pyobject(py)?.into_any(),
+        ColumnData::I64(x) => x.into_pyobject(py)?.into_any(),
+        ColumnData::U8(x) => x.into_pyobject(py)?.into_any(),
+        ColumnData::U16(x) => x.into_pyobject(py)?.into_any(),
+        ColumnData::U32(x) => x.into_pyobject(py)?.into_any(),
+        ColumnData::U64(x) => x.into_pyobject(py)?.into_any(),
+        ColumnData::F32(x) => f64::from(x).into_pyobject(py)?.into_any(),
+        ColumnData::F64(x) => x.into_pyobject(py)?.into_any(),
+        ColumnData::Unknown => "UNKNOWN".into_pyobject(py)?.into_any(),
+    })
 }
 
 #[pymethods]
@@ -21,12 +133,9 @@ impl PyIter {
     }
 
     fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<Py<PyAny>>> {
-        let dict = PyDict::new(slf.py());
-
         // Check if we have a finite count and if it's reached zero
         if let Some(ctr) = slf.n {
             if ctr == 0 {
-                // TODO: drop port
                 return Ok(None);
             } else {
                 slf.n = Some(ctr - 1);
@@ -34,58 +143,14 @@ impl PyIter {
         }
         // If n is None, we continue indefinitely
 
-        while dict.is_empty() {
-            // Check for keyboard interrupt
-            slf.py().check_signals()?;
-
-            let sample = match slf.port.next() {
-                Ok(sample) => sample,
-                Err(_) => return Ok(None), // End of stream or error
-            };
-            if !slf.stream.is_empty() && slf.stream != sample.stream.name {
-                continue;
-            }
-
-            for sample_column in &sample.columns {
-                let sample_column_name = sample_column.desc.name.clone();
-                let column_matches = slf.columns.is_empty() || slf.columns.iter().any(|c| {
-                    if c.ends_with("*") {
-                        // Remove * and check if sample_column_name starts with prefix
-                        let prefix = &c[..c.len()-1];
-                        sample_column_name.starts_with(prefix)
-                    } else {
-                        c.eq(&sample_column_name)
-                    }
-                });
-                if column_matches {
-                    let time = sample.timestamp_end().into_pyobject(slf.py())?;
-                    let stream_id = sample.stream.stream_id.into_pyobject(slf.py())?;
-                    dict.set_item("stream", stream_id)?;
-                    dict.set_item("time", time)?;
-                    match sample_column.value {
-                        data::ColumnData::Int(x) => {
-                            dict.set_item(sample_column_name.into_pyobject(slf.py())?, x.into_pyobject(slf.py())?)?
-                        }
-                        data::ColumnData::UInt(x) => {
-                            dict.set_item(sample_column_name.into_pyobject(slf.py())?, x.into_pyobject(slf.py())?)?
-                        }
-                        data::ColumnData::Float(x) => {
-                            dict.set_item(sample_column_name.into_pyobject(slf.py())?, x.into_pyobject(slf.py())?)?
-                        }
-                        _ => dict.set_item(sample_column_name.into_pyobject(slf.py())?, "UNKNOWN".into_pyobject(slf.py())?)?,
-                    };
-                }
-            }
-        }
-
-        Ok(Some(dict.into()))
+        let py = slf.py();
+        Ok(slf.next_dict(py)?.map(|dict| dict.into_any()))
     }
 }
 
 #[pyclass(name = "_Rpc")]
-// #[derive(Clone)]
 struct PyRpc {
-    inner: device::RpcDescriptor,
+    inner: RpcDescriptor,
 }
 
 #[pymethods]
@@ -97,18 +162,12 @@ impl PyRpc {
 
     #[getter]
     fn readable(&self) -> bool {
-        self.inner
-            .meta
-            .flags()
-            .contains(device::RpcMetaFlags::READABLE)
+        self.inner.meta.flags().contains(RpcMetaFlags::READABLE)
     }
 
     #[getter]
     fn writable(&self) -> bool {
-        self.inner
-            .meta
-            .flags()
-            .contains(device::RpcMetaFlags::WRITABLE)
+        self.inner.meta.flags().contains(RpcMetaFlags::WRITABLE)
     }
 
     #[getter]
@@ -123,10 +182,7 @@ impl PyRpc {
 
     #[getter]
     fn is_capture(&self) -> bool {
-        self.inner
-            .meta
-            .flags()
-            .contains(device::RpcMetaFlags::CAPTURE)
+        self.inner.meta.flags().contains(RpcMetaFlags::CAPTURE)
     }
 
     #[getter]
@@ -146,13 +202,29 @@ impl PyRpc {
 
 #[pyclass(name = "_RpcRegistry")]
 struct PyRegistry {
-    inner: device::RpcRegistry,
+    inner: Arc<RpcRegistry>,
 }
 
 #[pymethods]
 impl PyRegistry {
+    /// The names directly below `prefix`, sorted and without repeats.
     fn children_of(&self, prefix: &str) -> Vec<String> {
-        self.inner.children_of(prefix)
+        let lo = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}.")
+        };
+        let mut out: Vec<String> = Vec::new();
+        for name in self.inner.names() {
+            let Some(rest) = name.strip_prefix(&lo) else {
+                continue;
+            };
+            let seg = rest.split('.').next().unwrap_or(rest);
+            if out.last().map(String::as_str) != Some(seg) {
+                out.push(seg.to_string());
+            }
+        }
+        out
     }
 
     fn find(&self, name: &str) -> Option<PyRpc> {
@@ -188,9 +260,10 @@ impl PyRegistry {
 #[pyclass(name = "_Device", subclass)]
 struct PyDevice {
     root: String,
-    proxy: proxy::Interface,
-    route: proto::DeviceRoute,
-    rpc: device::RpcClient,
+    route: DeviceRoute,
+    /// Keeps the connection, and so its proxy link, open while the device lives.
+    _connection: Connection,
+    device: Device,
 }
 
 #[pymethods]
@@ -198,19 +271,16 @@ impl PyDevice {
     #[new]
     #[pyo3(signature = (root_url=None, route=None))]
     fn new(root_url: Option<String>, route: Option<String>) -> PyResult<PyDevice> {
-        let root = if let Some(url) = root_url {
-            url
-        } else {
-            "tcp://localhost".to_string()
+        let root = root_url.unwrap_or_else(|| "tcp://localhost".to_string());
+        let route = match route {
+            Some(path) => DeviceRoute::from_str(&path)
+                .map_err(|e| PyValueError::new_err(format!("invalid route '{path}': {e}")))?,
+            None => DeviceRoute::root(),
         };
-        let route = if let Some(path) = route {
-            proto::DeviceRoute::from_str(&path).unwrap()
-        } else {
-            proto::DeviceRoute::root()
-        };
-        let proxy = proxy::Interface::new(&root);
-        let rpc = device::RpcClient::open(&proxy, route.clone()).unwrap();
-        Ok(PyDevice { root, proxy, route, rpc })
+        let connection = Connection::open(&root)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to open '{root}': {e}")))?;
+        let device = connection.device(route.clone());
+        Ok(PyDevice { root, route, _connection: connection, device })
     }
 
     #[getter]
@@ -224,7 +294,7 @@ impl PyDevice {
     }
 
     fn _rpc<'py>(&self, py: Python<'py>, name: &str, req: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-        match self.rpc.raw_rpc(&self.route, name, req) {
+        match self.device.raw_rpc(name, req) {
             Ok(ret) => Ok(PyBytes::new(py, &ret[..])),
             _ => Err(PyRuntimeError::new_err(format!("RPC '{}' failed", name))),
         }
@@ -245,7 +315,7 @@ impl PyDevice {
         }
 
         let timeout = Duration::from_secs_f64(timeout_seconds);
-        let readout = device::capture::read_capture(&self.rpc, name, timeout)
+        let readout = ::twinleaf::device::capture::read_capture(&self.device, name, timeout)
             .map_err(|err| {
                 PyRuntimeError::new_err(format!("Capture RPC '{}' failed: {}", name, err))
             })?;
@@ -254,7 +324,9 @@ impl PyDevice {
             .map_err(|err| {
                 PyRuntimeError::new_err(format!("Capture RPC '{}' failed: {}", name, err))
             })?;
-        let x_values = readout.x_values_f64();
+        let x_values: Vec<f64> = (0..values.len())
+            .map(|index| readout.metadata.x_value_f64(index))
+            .collect();
         let meta = &readout.metadata;
 
         let dict = PyDict::new(py);
@@ -279,32 +351,22 @@ impl PyDevice {
     }
 
     fn _rpc_list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let port = self
-            .proxy
-            .subtree_rpc(self.route.clone())
+        let registry = self
+            .device
+            .rpc_registry()
             .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let specs = device::util::load_rpc_specs(&port)
-            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let list: Vec<_> = specs
-            .into_iter()
-            .map(|spec| (spec.full_name, spec.meta.bits()))
+        let list: Vec<_> = registry
+            .iter()
+            .map(|spec| (spec.full_name.clone(), spec.meta.bits()))
             .collect();
         Ok(PyList::new(py, list)?)
     }
 
     fn _rpc_registry(&self) -> PyResult<PyRegistry> {
-        let port = self
-            .proxy
-            .subtree_rpc(self.route.clone())
+        let registry = self
+            .device
+            .rpc_registry()
             .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let specs = device::util::load_rpc_specs(&port)
-            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let hash = self
-            .rpc
-            .get(&self.route, "rpc.hash")
-            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        let mut registry = device::RpcRegistry::new(specs);
-        registry.hash = Some(hash);
         Ok(PyRegistry { inner: registry })
     }
 
@@ -317,16 +379,17 @@ impl PyDevice {
         columns: Option<Vec<String>>,
     ) -> PyResult<PyIter> {
         Ok(PyIter {
-            port: device::Device::new(self.proxy.device_full(self.route.clone()).unwrap()),
-            n: n,
+            receiver: self.device.samples(),
+            batch: None,
+            row: 0,
+            n,
             stream: stream.unwrap_or_default(),
             columns: columns.unwrap_or_default(),
         })
     }
 
     fn _get_metadata<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let mut device = device::Device::new(self.proxy.device_full(self.route.clone()).unwrap());
-        let meta = match device.get_metadata() {
+        let meta = match self.device.metadata() {
             Ok(meta) => meta,
             Err(_) => return Err(PyRuntimeError::new_err("Failed to get metadata")),
         };
@@ -334,32 +397,34 @@ impl PyDevice {
         let dict = PyDict::new(py);
 
         // Convert device metadata to dict
+        let device = meta.device();
         let device_dict = PyDict::new(py);
-        device_dict.set_item("serial_number", meta.device.serial_number.to_string())?;
-        device_dict.set_item("firmware_hash", meta.device.firmware_hash.to_string())?;
-        device_dict.set_item("session_id", meta.device.session_id.to_string())?;
-        device_dict.set_item("name", meta.device.name.to_string())?;
+        device_dict.set_item("serial_number", device.serial().to_string())?;
+        device_dict.set_item("firmware_hash", device.firmware().to_string())?;
+        device_dict.set_item("session_id", device.session().to_string())?;
+        device_dict.set_item("name", device.name().to_string())?;
         dict.set_item("device", device_dict)?;
 
         // Convert streams to dict
         let streams_dict = PyDict::new(py);
-        for (_, stream) in meta.streams {
+        for (stream_id, stream) in meta.streams() {
+            let schema = stream.schema();
+            let stream_view = schema.stream();
             let stream_dict = PyDict::new(py);
-            stream_dict.set_item("stream_id", stream.stream.stream_id.to_string())?;
-            // stream_dict.set_item("name", stream.name.to_string())?;
+            stream_dict.set_item("stream_id", stream_id.to_string())?;
 
             let columns_dict = PyDict::new(py);
-            for col in stream.columns {
+            for col in schema.columns() {
                 let col_dict = PyDict::new(py);
-                col_dict.set_item("name", col.name.to_string())?;
-                col_dict.set_item("description", col.description.to_string())?;
-                col_dict.set_item("type", format!("{:?}", col.data_type))?;
-                col_dict.set_item("units", col.units.to_string())?;
+                col_dict.set_item("name", col.name())?;
+                col_dict.set_item("description", col.description())?;
+                col_dict.set_item("type", data_type_name(col.data_type()))?;
+                col_dict.set_item("units", col.units())?;
 
-                columns_dict.set_item(col.name.to_string(), col_dict)?;
+                columns_dict.set_item(col.name(), col_dict)?;
             }
             stream_dict.set_item("columns", columns_dict)?;
-            streams_dict.set_item(stream.stream.name.to_string(), stream_dict)?;
+            streams_dict.set_item(stream_view.name(), stream_dict)?;
         }
         dict.set_item("streams", streams_dict)?;
 
