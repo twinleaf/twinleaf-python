@@ -6,9 +6,10 @@ time out of every stream, after checking that the streams count time on the
 same clock.
 """
 
+import copy
 import time as _time
 import warnings
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
@@ -99,6 +100,19 @@ class StreamSlice:
             self.units[name] = units
         self.gaps = [Gap(self.path, *gap[1:]) for gap in raw["gaps"]]
         self._gap_ids = [gap[0] for gap in raw["gaps"]]
+        # How the rows were resampled onto another stream's times, or None
+        # for the stream's own rows.
+        self.resampled: str | None = None
+
+    def _derived(
+        self, time: np.ndarray, columns: dict[str, np.ndarray], resampled: str | None
+    ) -> "StreamSlice":
+        """A copy with other rows, keeping the stream's description."""
+        derived = copy.copy(self)
+        derived.time = time
+        derived._columns = columns
+        derived.resampled = resampled
+        return derived
 
     @property
     def columns(self) -> list[str]:
@@ -128,10 +142,50 @@ class StreamSlice:
         return {"time": self.time, **self._columns}
 
     def __repr__(self) -> str:
+        how = f", resampled ({self.resampled})" if self.resampled else ""
         return (
-            f"twinleaf.StreamSlice('{self.path}', {len(self)} rows at {self.rate_hz:g} Hz, "
+            f"twinleaf.StreamSlice('{self.path}', {len(self)} rows, {self.rate_hz:g} Hz source{how}, "
             f"columns={self.columns})"
         )
+
+
+_RESAMPLE_METHODS = ("previous", "linear")
+
+
+def _defined(source: StreamSlice, times: np.ndarray, method: str) -> np.ndarray:
+    """Where `source` defines a value at `times` by `method`: after its first
+    row for "previous", within its first and last rows for "linear", and in
+    neither case inside one of its gaps."""
+    t = source.time
+    if len(t) == 0:
+        return np.zeros(len(times), dtype=bool)
+    if method == "previous":
+        defined = times >= t[0]
+    else:
+        defined = (times >= t[0]) & (times <= t[-1])
+    for gap in source.gaps:
+        defined &= ~((times > gap.after) & (times < gap.before))
+    return defined
+
+
+def _resample_column(
+    t: np.ndarray,
+    values: np.ndarray,
+    times: np.ndarray,
+    method: str,
+    defined: np.ndarray,
+) -> np.ndarray:
+    if method == "previous":
+        index = np.searchsorted(t, times, side="right") - 1
+        if defined.all():
+            return values[index]  # every row has a value: keep the column's dtype
+        out = np.full(len(times), np.nan)
+        out[defined] = values[index[defined]]
+        return out
+    out = np.full(len(times), np.nan)
+    if defined.any():
+        out[defined] = np.interp(times[defined], t, values.astype(np.float64))
+    return out
 
 
 class Slice:
@@ -139,14 +193,99 @@ class Slice:
 
     Index by stream path, such as `s["/0/vector"]` or `s["/imu"]`, or by
     stream name when only one stream has it: `s["vector"]`. Each stream keeps
-    its own rate and its own `time` array; nothing is resampled.
+    its own rate and its own `time` array, unless `resample()` puts them on
+    one stream's times.
     """
 
     def __init__(
-        self, streams: list[StreamSlice], host_offsets: dict[Timebase, float | None]
+        self,
+        streams: list[StreamSlice],
+        host_offsets: dict[Timebase, float | None],
+        aligned_on: str | None = None,
     ):
         self._streams = {stream.path: stream for stream in streams}
         self._host_offsets = host_offsets
+        self._aligned_on = aligned_on
+
+    @property
+    def aligned_on(self) -> str | None:
+        """The stream whose times every stream was resampled onto, or None
+        for a slice whose streams keep their own times."""
+        return self._aligned_on
+
+    def resample(
+        self,
+        on: str,
+        method: str | Mapping[str, str],
+        *,
+        edges: str = "nan",
+    ) -> "Slice":
+        """Returns the slice with every stream resampled onto the times of
+        the stream `on`, such as `resample(on="/0/vector", method="previous")`.
+
+        `method` says how to find each stream's value at a time, and has no
+        default:
+
+        - "previous" holds the latest row that ended at or before the time.
+          This suits slow housekeeping data such as a barometer.
+        - "linear" interpolates between the rows around the time. This suits
+          signals sampled well above their bandwidth.
+
+        A dict of stream to method sets it per stream. Streams are aligned by
+        their end-of-sample times; device filter delays are not corrected.
+
+        Where a stream has no value, the result is NaN: before its first row,
+        after its last row for "linear", or inside one of its gaps.
+        `edges="trim"` drops those times instead, so every stream has a value
+        at every remaining time. "previous" keeps a column's dtype when no
+        value is NaN. Every stream keeps its source `rate_hz`, and its
+        `resampled` attribute names the method.
+        """
+        if edges not in ("nan", "trim"):
+            raise ValueError("edges must be 'nan' or 'trim'")
+        _ = self.timebase  # raises when the streams mix timebases
+        reference = self[on]
+        others = [stream for stream in self if stream.path != reference.path]
+        if isinstance(method, str):
+            methods = {stream.path: method for stream in others}
+        else:
+            methods = {self[path].path: m for path, m in method.items()}
+            missing = [s.path for s in others if s.path not in methods]
+            if missing:
+                raise ValueError(f"no resampling method given for {missing}")
+        for path, m in methods.items():
+            if m not in _RESAMPLE_METHODS:
+                raise ValueError(
+                    f"unknown method '{m}' for {path}: use 'previous' or 'linear'"
+                )
+
+        times = reference.time
+        defined = {s.path: _defined(s, times, methods[s.path]) for s in others}
+        keep = np.ones(len(times), dtype=bool)
+        if edges == "trim":
+            for mask in defined.values():
+                keep &= mask
+            if not keep.any():
+                raise NotEnoughData(
+                    f"no time of {reference.path} has a value from every stream"
+                )
+            times = times[keep]
+        streams = []
+        for stream in self:
+            if stream.path == reference.path:
+                columns = {
+                    name: values[keep] for name, values in stream._columns.items()
+                }
+                streams.append(stream._derived(times, columns, None))
+                continue
+            m = methods[stream.path]
+            mask = defined[stream.path][keep]
+            columns = {
+                name: _resample_column(stream.time, values, times, m, mask)
+                for name, values in stream._columns.items()
+            }
+            streams.append(stream._derived(times, columns, m))
+        return Slice(streams, self._host_offsets, aligned_on=reference.path)
 
     def __getitem__(self, path: str) -> StreamSlice:
         if path in self._streams:
@@ -223,9 +362,13 @@ class Slice:
     def __repr__(self) -> str:
         lines = ["twinleaf.Slice("]
         for stream in self:
-            lines.append(
-                f"  {stream.path}: {len(stream)} rows at {stream.rate_hz:g} Hz, {stream.columns}"
-            )
+            if stream.resampled:
+                rows = (
+                    f"{len(stream)} rows, {stream.resampled} from {stream.rate_hz:g} Hz"
+                )
+            else:
+                rows = f"{len(stream)} rows at {stream.rate_hz:g} Hz"
+            lines.append(f"  {stream.path}: {rows}, {stream.columns}")
         for timebase in self.timebases:
             members = [s for s in self if s.timebase == timebase]
             lines.append(

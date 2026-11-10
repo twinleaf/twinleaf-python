@@ -111,6 +111,19 @@ with tree.acquire(retention=60) as acq:    # keeps the latest 60 s of every stre
 - Lost samples are listed in `s.gaps` and reported once each with `twinleaf.SampleLossWarning`. A `ConnectionError` is raised if the proxy goes away.
 - Device time is usually the uptime of the device that owns the clock. `s.host_time_offset` estimates the seconds to add for UNIX time.
 
+To put every stream on one time grid, resample onto one stream's times. There is no default method, because the right one depends on the signal:
+
+```python
+r = s.resample(on='/0/vector', method='previous')     # hold the latest earlier row
+r = s.resample(on='/0/vector', method={'/imu': 'linear', '/bar': 'previous'})
+r['/bar']['measure']       # now one value per vector row
+```
+
+- `previous` holds the latest row that ended at or before each time. It suits slow housekeeping data.
+- `linear` interpolates between neighboring rows. It suits signals sampled well above their bandwidth.
+- Streams are aligned by end-of-sample time; device filter delays are not corrected.
+- A time where a stream has no value is NaN. That is before the stream's first row, after its last row for `linear`, or inside one of its gaps. `edges='trim'` drops those times instead.
+
 See [docs/multi-sensor-api.md](docs/multi-sensor-api.md) for the design.
 
 ### The tio proxy
