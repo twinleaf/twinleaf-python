@@ -61,9 +61,15 @@ Phase 2 as built, with how it differs from section 3 below:
   `ConnectionError`.
 - **Tested** on the simulator: streams of one device at 1000 and 25 Hz, two
   devices with different clocks, a device restart, a proxy stop, and lost
-  samples. It could not be tested on the VMR-SANDI, which was disconnected by
-  then; that tree's shared-clock case follows the same code path, grouping
-  streams by timebase.
+  samples.
+- **Tested on the VMR-SANDI** (10 November 2026), on the hub-clock case the
+  simulator cannot produce:
+  - The VMR's `/0/vector` and the COMM-USB's `/imu`, `/bar`, `/aux` and
+    `/sync` were accepted as one timebase, `systime` of `COMM-USB.00084`.
+  - A 5 s slice held exactly 1000 / 50 / 20 rows of vector / imu / bar, all
+    inside the interval.
+  - A 30 s window of all five streams held exactly 6000 / 300 / 120 / 300 / 30
+    rows on uniform steps, with no gaps and no dropped batches.
 
 ## What we have to work with
 
