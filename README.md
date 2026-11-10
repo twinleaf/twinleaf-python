@@ -66,7 +66,37 @@ for device in tree:
 
 The devices of a tree share one connection. `twinleaf.Device(url, route)` also reuses the tree for that `url`, so opening several devices on one port costs one connection. `twinleaf.connect([url1, url2])` mounts several devices as one tree at `/0`, `/1`, …. Discovery listens for two seconds; `tree.refresh()` looks again.
 
-Samples read from two devices with separate `samples(n)` calls cover different time intervals. Reading synchronized slices across devices is planned; see [docs/multi-sensor-api.md](docs/multi-sensor-api.md).
+### Synchronized data from several devices
+
+Samples read from two devices with separate `samples(n)` calls cover different time intervals. To get the same interval from several streams, read them from the tree:
+
+```python
+s = tree.samples(5, ['/0/vector', '/imu', '/bar'])    # the same 5 s of every stream
+s['/0/vector'].time        # numpy array of end-of-sample times, in device seconds
+s['/0/vector']['x']        # numpy array of vector.x, in nT
+s['/imu']['accel.z']
+s.timebase                 # the clock every stream counts on
+s.gaps                     # samples lost within the slice
+```
+
+A stream is named by its device's route and its name: `/imu` on the device at `/`, `/0/vector` on the device at `/0`. Each stream keeps its own rate and its own `time` array; nothing is resampled.
+
+For repeated reads, an acquisition buffers every stream in the background:
+
+```python
+with tree.acquire(retention=60) as acq:    # keeps the latest 60 s of every stream
+    acq.wait(10)                            # until 10 s of every stream are buffered
+    s = acq.window(10)                      # the latest 10 s that every stream has
+    s = acq.slice(5120.0, 5125.0)           # an explicit interval of device time
+```
+
+- The interval is in device time, never the time the host received the data. A window ends at the newest time every stream has reached, so slow streams such as `bar` at 4 Hz are complete up to its end. A slice holds the rows whose end-of-sample time lies in `(start, end]`.
+- Streams can only be compared if they count time on the same clock. Sensors behind one hub share the hub's clock. If the requested streams don't share one, `twinleaf.TimebaseMismatch` is raised. `allow_mixed_timebases=True` returns each clock's streams over that clock's latest window instead.
+- `twinleaf.NotEnoughData` says which stream is short when the buffer doesn't cover the interval. That happens just after starting, or after a device restart, which ends a stream's run.
+- Lost samples are listed in `s.gaps` and reported once each with `twinleaf.SampleLossWarning`. A `ConnectionError` is raised if the proxy goes away.
+- Device time is usually the uptime of the device that owns the clock. `s.host_time_offset` estimates the seconds to add for UNIX time.
+
+See [docs/multi-sensor-api.md](docs/multi-sensor-api.md) for the design.
 
 ### The tio proxy
 

@@ -1,7 +1,7 @@
 # Proposal: multiple sensors and synchronized data in the Python API
 
-Status: phase 1 (the tree) is implemented; phases 2 to 4 are a proposal, for
-review. Written 9 November 2026 against twinleaf 2.0.0 and the VMR-SANDI setup
+Status: phases 1 (the tree) and 2 (synchronized acquisition) are implemented;
+phases 3 and 4 are a proposal, for review. Written 9 November 2026 against twinleaf 2.0.0 and the VMR-SANDI setup
 connected on `/dev/cu.usbmodem14201`.
 
 Phase 1 as built:
@@ -21,6 +21,49 @@ Phase 1 as built:
   VMR, it uses the device serial from the metadata instead.
 - **Unknown routes:** `tree[route]` raises `KeyError` for a route discovery
   did not find, instead of waiting for RPC timeouts.
+
+Phase 2 as built, with how it differs from section 3 below:
+
+- **API:** `tree.acquire(streams=None, *, retention=60)` returns an
+  `Acquisition` with `wait()`, `window()`, `slice()` and `close()`, which
+  also works as a context manager. `tree.samples(seconds, streams)` does all
+  of it in one call. It returns a `Slice` of `StreamSlice`s, each with numpy
+  `time` and column arrays, `units`, `rate_hz`, `timebase` and `gaps`.
+- **Buffering:** a Rust thread drains `tree.samples()` into one ring per
+  stream, without the GIL. Each ring holds the rows' times and their
+  column values, in each column's native numpy dtype. Python receives
+  bytes and wraps them with `np.frombuffer`, so the extension does not
+  depend on the `numpy` crate. numpy is now a required Python dependency.
+- **Known streams:** the streams of every device are learned from metadata
+  when the acquisition starts. `wait()` therefore waits for slow streams too,
+  instead of only the streams that happened to arrive first.
+- **`wait(seconds)`** waits until `window(seconds)` would succeed, not for a
+  fixed time. It raises `NotEnoughData` after a timeout, naming the stream
+  that is short, such as one that is disabled.
+- **Selection rules:**
+  - Rows are those whose end-of-sample time lies in `(start, end]`, so
+    adjacent slices share no row.
+  - A stream covers an interval when its first retained sample began by
+    `start`, and its next sample would end after `end`.
+  - `slice()` requires every stream to cover the interval, unless
+    `trim="overlap"`.
+- **Mixed timebases:** `allow_mixed_timebases` exists only on `window()`. An
+  explicit `slice(start, end)` cannot apply one interval to two clocks.
+- **Wall-clock offset:** `host_time_offset` is the *minimum* host-minus-device
+  difference seen, not the median. Transport delay only ever adds to the
+  difference, so the minimum is the closest estimate. It is exactly 0 for a
+  UNIX epoch.
+- **Run breaks:** a device restart, a timebase change, time going backward, or
+  a change of columns clears the stream's rows. A window that would reach
+  before the break raises `NotEnoughData` with the reason.
+- **Not yet done:** an acquisition does not issue `DeviceLostWarning`; a lost
+  device shows as `NotEnoughData` from `wait()`, and a lost proxy as
+  `ConnectionError`.
+- **Tested** on the simulator: streams of one device at 1000 and 25 Hz, two
+  devices with different clocks, a device restart, a proxy stop, and lost
+  samples. It could not be tested on the VMR-SANDI, which was disconnected by
+  then; that tree's shared-clock case follows the same code path, grouping
+  streams by timebase.
 
 ## What we have to work with
 

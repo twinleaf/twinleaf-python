@@ -3,6 +3,13 @@ from collections.abc import Iterator, Sequence
 from typing import NamedTuple
 
 from twinleaf import _twinleaf
+from twinleaf._acquisition import Acquisition as Acquisition
+from twinleaf._acquisition import Gap as Gap
+from twinleaf._acquisition import NotEnoughData as NotEnoughData
+from twinleaf._acquisition import Slice as Slice
+from twinleaf._acquisition import StreamSlice as StreamSlice
+from twinleaf._acquisition import Timebase as Timebase
+from twinleaf._acquisition import TimebaseMismatch as TimebaseMismatch
 from twinleaf._twinleaf import DeviceLostWarning as DeviceLostWarning
 from twinleaf._twinleaf import SampleLossWarning as SampleLossWarning
 
@@ -583,6 +590,34 @@ class Tree:
                 continue
             matches.append(self[info.route])
         return matches
+
+    def acquire(
+        self, streams: Sequence[str] | None = None, *, retention: float = 60.0
+    ) -> Acquisition:
+        """Starts buffering every stream of the tree, or only `streams`, such
+        as `["/0/vector", "/imu"]`, keeping the latest `retention` seconds of
+        each. Use it as a context manager, or close it when done:
+
+            with tree.acquire() as acq:
+                acq.wait(5)
+                s = acq.window(5)   # the same 5 s of device time from every stream
+        """
+        return Acquisition(self, streams, retention)
+
+    def samples(
+        self,
+        seconds: float,
+        streams: Sequence[str] | None = None,
+        *,
+        timeout: float | None = None,
+        allow_mixed_timebases: bool = False,
+    ) -> Slice:
+        """Acquires `seconds` of every stream, or of `streams`, and returns
+        them as one `Slice` over the same interval of device time. See
+        `Acquisition.window()`."""
+        with self.acquire(streams, retention=max(2 * seconds, seconds + 10)) as acq:
+            acq.wait(seconds, timeout=timeout)
+            return acq.window(seconds, allow_mixed_timebases=allow_mixed_timebases)
 
     def __repr__(self) -> str:
         lines = [f"{self.__module__}.{self.__class__.__name__}('{self.url}')"]

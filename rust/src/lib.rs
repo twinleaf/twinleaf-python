@@ -1,3 +1,5 @@
+mod acquisition;
+
 use std::ffi::CString;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -396,6 +398,19 @@ impl PyTree {
         self.label.clone()
     }
 
+    /// Starts buffering the streams of `routes`, or only those named in
+    /// `streams`, keeping `retention` seconds of each.
+    #[pyo3(signature = (routes, streams=None, retention=60.0))]
+    fn _acquire(
+        &self,
+        py: Python<'_>,
+        routes: Vec<String>,
+        streams: Option<Vec<String>>,
+        retention: f64,
+    ) -> PyResult<acquisition::PyAcquisition> {
+        acquisition::PyAcquisition::start(py, &self.tree, routes, streams, retention)
+    }
+
     /// Listens for `window_seconds` and returns every route the proxy has
     /// heard, each with its `dev.name` and `dev.serial`, or `None` where the
     /// device did not answer. A device whose `dev.serial` is blank gets the
@@ -656,6 +671,7 @@ fn _parse_route(route: &str) -> PyResult<String> {
 #[pymodule]
 fn _twinleaf(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTree>()?;
+    m.add_class::<acquisition::PyAcquisition>()?;
     m.add_class::<PyDevice>()?;
     m.add_function(wrap_pyfunction!(_parse_route, m)?)?;
     m.add_class::<PyRpc>()?;
