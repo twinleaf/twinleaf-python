@@ -305,6 +305,9 @@ class _Rpc(_RpcNode):
         match pyrpc.type_str:
             case "capture":
                 self._data_type = None
+            case "bool":
+                self._type = bool
+                self._data_type = 0
             case t if t.startswith("u"):
                 self._type = int
                 self._data_type = 0
@@ -333,7 +336,7 @@ class _Rpc(_RpcNode):
         if hasattr(self, "_signed") and not self._signed:
             ret += "u"
         ret += self._type.__name__ if self._type is not None else "none"
-        if self._data_size:  # is not 0 or None
+        if self._data_size and self._type is not bool:  # is not 0 or None
             ret += str(self._data_size * 8)
         ret += ")"
         return ret
@@ -346,6 +349,15 @@ class _Rpc(_RpcNode):
             return self._device._capture(self.__name__, float(arg), raw)
 
         match self._type:
+            case t if t is bool:
+                if arg is not None and not (isinstance(arg, bool) or arg in (0, 1)):
+                    raise TypeError(f"{self.__name__} expects True or False")
+                value = None if arg is None else int(arg)
+                return bool(
+                    self._device._rpc_int(
+                        self.__name__, self._data_size or 1, False, value
+                    )
+                )
             case t if t is int:
                 assert arg is None or isinstance(arg, int)
                 assert self._data_size is not None
