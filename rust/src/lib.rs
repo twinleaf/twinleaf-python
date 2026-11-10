@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use ::twinleaf::data::{ColumnData, SampleBatch};
 use ::twinleaf::device::rpc::{RpcDescriptor, RpcMetaExt, RpcMetaFlags, RpcRegistry};
-use ::twinleaf::device::{Connection, Device, Presence, RecvError, Receiver};
+use ::twinleaf::device::{Connection, Device, DeviceTree, Presence, RecvError, Receiver};
 use ::twinleaf::proto::DeviceRoute;
+use ::twinleaf::proxy::{Layout, Mount};
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyRuntimeWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -336,6 +337,118 @@ impl PyRegistry {
     }
 }
 
+/// Parses a route such as `/0/1`, `0/1` or `/`.
+fn parse_route(path: &str) -> PyResult<DeviceRoute> {
+    DeviceRoute::from_str(path)
+        .map_err(|e| PyValueError::new_err(format!("invalid route '{path}': {e}")))
+}
+
+/// Opens the default device when `urls` is `None` or empty, the device at
+/// the one URL given, or every URL given mounted as one tree at `/0`, `/1`,
+/// and so on. Returns a label for the connection and the connection.
+fn open_connection(py: Python<'_>, urls: Option<Vec<String>>) -> PyResult<(String, Connection)> {
+    let urls = urls.unwrap_or_default();
+    let (label, opened) = match urls.as_slice() {
+        [] => ("auto".to_string(), py.detach(Connection::connect)),
+        [url] => (url.clone(), py.detach(|| Connection::open(url))),
+        _ => {
+            let mut mounts = Vec::with_capacity(urls.len());
+            for (index, url) in urls.iter().enumerate() {
+                let hop = u8::try_from(index)
+                    .map_err(|_| PyValueError::new_err("at most 256 URLs can be mounted"))?;
+                mounts.push(Mount {
+                    url: url.clone(),
+                    source: DeviceRoute::root(),
+                    prefix: DeviceRoute::from_hops(&[hop])
+                        .map_err(|e| PyValueError::new_err(format!("{e}")))?,
+                });
+            }
+            let layout = Layout { mounts };
+            (urls.join(", "), py.detach(|| Connection::open_layout(&layout)))
+        }
+    };
+    let connection =
+        opened.map_err(|e| PyRuntimeError::new_err(format!("failed to open '{label}': {e}")))?;
+    Ok((label, connection))
+}
+
+/// One connection to a whole device tree, which every device of the tree
+/// shares.
+#[pyclass(name = "_Tree")]
+struct PyTree {
+    label: String,
+    connection: Connection,
+    tree: DeviceTree,
+}
+
+#[pymethods]
+impl PyTree {
+    #[new]
+    #[pyo3(signature = (urls=None))]
+    fn new(py: Python<'_>, urls: Option<Vec<String>>) -> PyResult<PyTree> {
+        let (label, connection) = open_connection(py, urls)?;
+        let tree = connection.tree(DeviceRoute::root());
+        Ok(PyTree { label, connection, tree })
+    }
+
+    #[getter]
+    fn _url(&self) -> String {
+        self.label.clone()
+    }
+
+    /// Listens for `window_seconds` and returns every route the proxy has
+    /// heard, each with its `dev.name` and `dev.serial`, or `None` where the
+    /// device did not answer. A device whose `dev.serial` is blank gets the
+    /// serial from its metadata instead, which the proxy has usually
+    /// collected already.
+    fn _discover(
+        &self,
+        py: Python<'_>,
+        window_seconds: f64,
+    ) -> PyResult<Vec<(String, Option<String>, Option<String>)>> {
+        if !window_seconds.is_finite() || window_seconds < 0.0 {
+            return Err(PyValueError::new_err(
+                "discovery window must be a non-negative finite number of seconds",
+            ));
+        }
+        let window = Duration::from_secs_f64(window_seconds);
+        let tree = &self.tree;
+        Ok(py.detach(|| {
+            let routes = tree.discover_routes(window);
+            // Send every call before waiting on any, so the devices answer in
+            // parallel.
+            let pending: Vec<_> = routes
+                .iter()
+                .map(|route| {
+                    (
+                        tree.submit(route.clone(), "dev.name", &[]),
+                        tree.submit(route.clone(), "dev.serial", &[]),
+                    )
+                })
+                .collect();
+            let text = |reply: Result<Vec<u8>, _>| {
+                reply
+                    .ok()
+                    .map(|bytes: Vec<u8>| String::from_utf8_lossy(&bytes).trim().to_string())
+                    .filter(|text| !text.is_empty())
+            };
+            routes
+                .iter()
+                .zip(pending)
+                .map(|(route, (name, serial))| {
+                    let serial = text(serial.wait()).or_else(|| {
+                        tree.metadata(route.clone())
+                            .ok()
+                            .map(|meta| meta.device().serial().trim().to_string())
+                            .filter(|serial| !serial.is_empty())
+                    });
+                    (route.to_string(), text(name.wait()), serial)
+                })
+                .collect()
+        }))
+    }
+}
+
 #[pyclass(name = "_Device", subclass)]
 struct PyDevice {
     root: String,
@@ -357,18 +470,24 @@ impl PyDevice {
 #[pymethods]
 impl PyDevice {
     #[new]
-    #[pyo3(signature = (root_url=None, route=None))]
-    fn new(py: Python<'_>, root_url: Option<String>, route: Option<String>) -> PyResult<PyDevice> {
-        let root = root_url.unwrap_or_else(|| "tcp://localhost".to_string());
+    /// Binds `route` on `tree`'s connection when a tree is given, or else
+    /// opens a connection of its own to `root_url`, or to the default device
+    /// when that is `None`.
+    #[pyo3(signature = (root_url=None, route=None, tree=None))]
+    fn new(
+        py: Python<'_>,
+        root_url: Option<String>,
+        route: Option<String>,
+        tree: Option<PyRef<'_, PyTree>>,
+    ) -> PyResult<PyDevice> {
         let route = match route {
-            Some(path) => DeviceRoute::from_str(&path)
-                .map_err(|e| PyValueError::new_err(format!("invalid route '{path}': {e}")))?,
+            Some(path) => parse_route(&path)?,
             None => DeviceRoute::root(),
         };
-        // Opening can wait up to 15 s for the proxy, so release the GIL.
-        let connection = py
-            .detach(|| Connection::open(&root))
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to open '{root}': {e}")))?;
+        let (root, connection) = match tree {
+            Some(tree) => (tree.label.clone(), tree.connection.clone()),
+            None => open_connection(py, root_url.map(|url| vec![url]))?,
+        };
         let device = connection.device(route.clone());
         Ok(PyDevice { root, route, _connection: connection, device })
     }
@@ -524,12 +643,21 @@ impl PyDevice {
     }
 }
 
+/// Returns `route` in canonical form, such as `/0/1`. Raises `ValueError`
+/// for a malformed route.
+#[pyfunction]
+fn _parse_route(route: &str) -> PyResult<String> {
+    Ok(parse_route(route)?.to_string())
+}
+
 /// A Python module implemented in Rust. The name of this function must match
 /// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
 /// import the module.
 #[pymodule]
 fn _twinleaf(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyTree>()?;
     m.add_class::<PyDevice>()?;
+    m.add_function(wrap_pyfunction!(_parse_route, m)?)?;
     m.add_class::<PyRpc>()?;
     m.add_class::<PyRegistry>()?;
     m.add("SampleLossWarning", m.py().get_type::<SampleLossWarning>())?;
