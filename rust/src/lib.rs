@@ -74,7 +74,9 @@ impl PyIter {
 
             let batch = loop {
                 py.check_signals()?;
-                match self.receiver.recv_timeout(SIGNAL_POLL) {
+                // Release the GIL while waiting so other Python threads run.
+                let receiver = &self.receiver;
+                match py.detach(|| receiver.recv_timeout(SIGNAL_POLL)) {
                     Ok(batch) => break batch,
                     Err(RecvError::Timeout) | Err(RecvError::Lagged(_)) => continue,
                     Err(_) => return Ok(None), // End of stream
@@ -246,18 +248,29 @@ struct PyDevice {
     device: Device,
 }
 
+impl PyDevice {
+    /// Loads the device's RPC table, with the GIL released while it waits.
+    fn load_registry(&self, py: Python<'_>) -> PyResult<Arc<RpcRegistry>> {
+        let device = &self.device;
+        py.detach(|| device.rpc_registry())
+            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+    }
+}
+
 #[pymethods]
 impl PyDevice {
     #[new]
     #[pyo3(signature = (root_url=None, route=None))]
-    fn new(root_url: Option<String>, route: Option<String>) -> PyResult<PyDevice> {
+    fn new(py: Python<'_>, root_url: Option<String>, route: Option<String>) -> PyResult<PyDevice> {
         let root = root_url.unwrap_or_else(|| "tcp://localhost".to_string());
         let route = match route {
             Some(path) => DeviceRoute::from_str(&path)
                 .map_err(|e| PyValueError::new_err(format!("invalid route '{path}': {e}")))?,
             None => DeviceRoute::root(),
         };
-        let connection = Connection::open(&root)
+        // Opening can wait up to 15 s for the proxy, so release the GIL.
+        let connection = py
+            .detach(|| Connection::open(&root))
             .map_err(|e| PyRuntimeError::new_err(format!("failed to open '{root}': {e}")))?;
         let device = connection.device(route.clone());
         Ok(PyDevice { root, route, _connection: connection, device })
@@ -274,7 +287,8 @@ impl PyDevice {
     }
 
     fn _rpc<'py>(&self, py: Python<'py>, name: &str, req: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-        match self.device.raw_rpc(name, req) {
+        let device = &self.device;
+        match py.detach(|| device.raw_rpc(name, req)) {
             Ok(ret) => Ok(PyBytes::new(py, &ret[..])),
             _ => Err(PyRuntimeError::new_err(format!("RPC '{}' failed", name))),
         }
@@ -295,7 +309,9 @@ impl PyDevice {
         }
 
         let timeout = Duration::from_secs_f64(timeout_seconds);
-        let readout = ::twinleaf::device::capture::read_capture(&self.device, name, timeout)
+        let device = &self.device;
+        let readout = py
+            .detach(|| ::twinleaf::device::capture::read_capture(device, name, timeout))
             .map_err(|err| {
                 PyRuntimeError::new_err(format!("Capture RPC '{}' failed: {}", name, err))
             })?;
@@ -331,10 +347,7 @@ impl PyDevice {
     }
 
     fn _rpc_list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        let registry = self
-            .device
-            .rpc_registry()
-            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
+        let registry = self.load_registry(py)?;
         let list: Vec<_> = registry
             .iter()
             .map(|spec| (spec.full_name.clone(), spec.meta.bits()))
@@ -342,12 +355,8 @@ impl PyDevice {
         Ok(PyList::new(py, list)?)
     }
 
-    fn _rpc_registry(&self) -> PyResult<PyRegistry> {
-        let registry = self
-            .device
-            .rpc_registry()
-            .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))?;
-        Ok(PyRegistry { inner: registry })
+    fn _rpc_registry(&self, py: Python<'_>) -> PyResult<PyRegistry> {
+        Ok(PyRegistry { inner: self.load_registry(py)? })
     }
 
     #[pyo3(signature = (n=None, stream=None, columns=None))]
@@ -369,7 +378,8 @@ impl PyDevice {
     }
 
     fn _get_metadata<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        let meta = match self.device.metadata() {
+        let device = &self.device;
+        let meta = match py.detach(|| device.metadata()) {
             Ok(meta) => meta,
             Err(_) => return Err(PyRuntimeError::new_err("Failed to get metadata")),
         };
