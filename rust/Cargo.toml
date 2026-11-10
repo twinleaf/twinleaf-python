@@ -9,8 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.30", features = ["extension-module"] }
-twinleaf = { version = "2.0" }
-crossbeam = "0.8"
+twinleaf = { version = "2.0", default-features = false, features = ["serial"] }
 
 [profile.release]
 # macOS 27's dyld rejects a Mach-O whose LINKEDIT string pool is not 8-byte
