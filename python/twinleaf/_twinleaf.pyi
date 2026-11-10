@@ -5,7 +5,7 @@ Mirrors the pyo3 bindings in rust/src/lib.rs. Keep in sync with the
 """
 
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Self
 
 class SampleLossWarning(RuntimeWarning):
     """Samples of a stream were lost between two rows."""
@@ -35,10 +35,23 @@ class _RpcRegistry:
     def hash(self) -> int | None: ...
     def __repr__(self) -> str: ...
 
+def _parse_route(route: str) -> str: ...
+
+class _Tree:
+    def __new__(cls, urls: list[str] | None = ...) -> _Tree: ...
+    @property
+    def _url(self) -> str: ...
+    def _discover(
+        self, window_seconds: float
+    ) -> list[tuple[str, str | None, str | None]]: ...
+
 class _Device:
     def __new__(
-        cls, root_url: str | None = ..., route: str | None = ...
-    ) -> _Device: ...
+        cls,
+        root_url: str | None = ...,
+        route: str | None = ...,
+        tree: _Tree | None = ...,
+    ) -> Self: ...
     @property
     def _url(self) -> str: ...
     @property

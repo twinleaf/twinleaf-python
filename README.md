@@ -38,13 +38,39 @@ import twinleaf
 vmr = twinleaf.Device('serial://COM1')
 print(vmr.samples.vector(10))
 ```
+
 To find possible tio ports to use run `tio list`. Windows will often output some COMx port such as `serial://COM3`, while Mac OS will output some cu.XXXXX or tty.XXXXX name such as `serial:///dev/cu.usbserialXXXXXX` or `serial:///dev/tty.usbmodemXXXXXX`. 
 
 If `tio list` does not find your device, try `tio list --all`, or look at serial ports in the respective OS device manager for active serial ports. 
 
+### Several devices
+
+A hub and the sensors behind it share one port, and each device has a route: `/` for the device on the port, `/0`, `/1`, … for the devices behind it. `twinleaf.connect()` finds every device and returns them as a tree:
+
+```python
+import twinleaf
+tree = twinleaf.connect('serial:///dev/cu.usbmodem14201')
+print(tree)
+# twinleaf.Tree('serial:///dev/cu.usbmodem14201')
+#   /   COMM-USB  COMM-USB.00084
+#   /0  VMR       01000000170030001450415452373720
+
+vmr = tree['/0']                   # a twinleaf.Device, with settings.* and samples.*
+hub = tree['/']
+vmr.settings.vector.data.decimation()
+hub.samples.imu(10)
+tree.find(name='VMR')              # devices by dev.name, or serial=...
+for device in tree:
+    print(device)
+```
+
+The devices of a tree share one connection. `twinleaf.Device(url, route)` also reuses the tree for that `url`, so opening several devices on one port costs one connection. `twinleaf.connect([url1, url2])` mounts several devices as one tree at `/0`, `/1`, …. Discovery listens for two seconds; `tree.refresh()` looks again.
+
+Samples read from two devices with separate `samples(n)` calls cover different time intervals. Reading synchronized slices across devices is planned; see [docs/multi-sensor-api.md](docs/multi-sensor-api.md).
+
 ### The tio proxy
 
-Every connection goes through a proxy on `localhost:7855`, which shares each device between processes. `twinleaf.Device()` with no URL needs a running proxy, such as one started with `tio proxy`, and uses the device that proxy selects. Opening a device by URL, such as `twinleaf.Device('serial:///dev/ttyACM0')`, starts `tio proxy` in the background when no proxy is running. If `tio` is not installed, the Python process hosts the proxy itself, and other scripts connected through it lose their devices when that process exits. Installing the tools is recommended:
+Every connection goes through a proxy on `localhost:7855`, which shares each device between processes. `twinleaf.Device()` with no URL uses the default device: the one a running proxy selects, or else the single Twinleaf serial device attached. When no proxy is running, opening a device starts `tio proxy` in the background. If `tio` is not installed, the Python process hosts the proxy itself, and other scripts connected through it lose their devices when that process exits. Installing the tools is recommended:
 
     cargo install twinleaf-tools
 

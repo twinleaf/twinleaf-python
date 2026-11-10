@@ -1,16 +1,36 @@
+import weakref
+from collections.abc import Iterator, Sequence
+from typing import NamedTuple
+
 from twinleaf import _twinleaf
 from twinleaf._twinleaf import DeviceLostWarning as DeviceLostWarning
 from twinleaf._twinleaf import SampleLossWarning as SampleLossWarning
 
 
 class Device(_twinleaf._Device):
-    """Primary TIO interface with sensor object"""
+    """Primary TIO interface with sensor object.
 
-    def __new__(cls, url=None, route=None, announce=False, instantiate=True):
-        device = super().__new__(cls, url, route)
+    `url` names the device, or the default device when it is None. Devices
+    opened with the same `url` share one connection, the `Tree` that
+    `twinleaf.connect(url)` returns, which is available as `device.tree`.
+    """
+
+    tree: "Tree"
+
+    def __new__(
+        cls, url=None, route=None, announce=False, instantiate=True, *, tree=None
+    ):
+        if tree is None:
+            tree = connect(url, discover=0)
+        device = super().__new__(cls, None, route, tree._tree)
+        # Holding the tree keeps the shared connection, and its cache entry,
+        # alive as long as the device.
+        device.tree = tree
         return device
 
-    def __init__(self, url=None, route=None, announce=False, instantiate=True):
+    def __init__(
+        self, url=None, route=None, announce=False, instantiate=True, *, tree=None
+    ):
         super().__init__()
         if instantiate:
             self._instantiate_rpcs()
@@ -21,7 +41,7 @@ class Device(_twinleaf._Device):
             dev_info = self._rpc("dev.serial", b"").decode()
         except RuntimeError:
             dev_info = ""
-        return f"{self.__module__}.{self.__class__.__name__}('{dev_info}', url='{self._url}', route='{self._route}'"
+        return f"{self.__module__}.{self.__class__.__name__}('{dev_info}', url='{self._url}', route='{self._route}')"
 
     def _rpc_int(
         self, name: str, size: int, signed: bool, value: int | None = None
@@ -432,3 +452,151 @@ class _SamplesList(_SamplesBase):
         return self._device._samples_list(
             n, self._stream, self._columns, time_column=time_column, title_row=title_row
         )
+
+
+# Device trees
+class DeviceInfo(NamedTuple):
+    """A device that discovery found: its route, `dev.name` and `dev.serial`.
+
+    `name` and `serial` are None when the device did not answer.
+    """
+
+    route: str
+    name: str | None
+    serial: str | None
+
+
+def _url_key(url: str | Sequence[str] | None) -> tuple[str, ...]:
+    if url is None:
+        return ()
+    if isinstance(url, str):
+        return (url,)
+    return tuple(url)
+
+
+# One live Tree per URL, so every Device opened on a URL shares its connection.
+# The cache holds them weakly: a tree closes once no Tree or Device uses it.
+_trees: "weakref.WeakValueDictionary[tuple[str, ...], Tree]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def connect(url: str | Sequence[str] | None = None, *, discover: float = 2.0) -> "Tree":
+    """Connects to a device tree and returns it.
+
+    `url` names a device, such as `serial:///dev/ttyACM0`, or the default
+    device when it is None. A list of URLs mounts each device at `/0`, `/1`,
+    and so on, as one tree. Calls with the same `url` return the same Tree
+    while it is in use.
+
+    Discovery listens for `discover` seconds for the devices of the tree. It
+    runs once per tree; `Tree.refresh()` runs it again.
+    """
+    key = _url_key(url)
+    tree = _trees.get(key)
+    if tree is None:
+        tree = Tree(url)
+        _trees[key] = tree
+    if discover and not tree._discovered:
+        tree.refresh(discover)
+    return tree
+
+
+class Tree:
+    """Every device reachable through one connection, such as a hub and the
+    sensors behind it.
+
+    Use `twinleaf.connect(url)` to get one. Index it by route to get a
+    `Device`: `tree["/0"]`. The devices share the tree's connection.
+    """
+
+    def __init__(self, url: str | Sequence[str] | None = None):
+        key = _url_key(url)
+        self._tree = _twinleaf._Tree(list(key) if key else None)
+        self._info: dict[str, DeviceInfo] = {}
+        self._devices: dict[str, Device] = {}
+        self._discovered = False
+
+    @property
+    def url(self) -> str:
+        """The URL, or URLs, the tree was opened with, or 'auto'."""
+        return self._tree._url
+
+    def refresh(self, seconds: float = 2.0) -> list[DeviceInfo]:
+        """Listens for `seconds` for the tree's devices, and asks each for its
+        name and serial. Returns what it found."""
+        found = self._tree._discover(seconds)
+        self._info = {
+            route: DeviceInfo(route, name, serial) for route, name, serial in found
+        }
+        self._discovered = True
+        return self.info
+
+    @property
+    def info(self) -> list[DeviceInfo]:
+        """The devices found, in route order, without opening them."""
+        return [self._info[route] for route in self.routes]
+
+    @property
+    def routes(self) -> list[str]:
+        """The routes of the devices found, in order."""
+        return sorted(self._info, key=_route_sort_key)
+
+    def __getitem__(self, route: str) -> Device:
+        """Returns the device at `route`, such as "/0", opening it on first use."""
+        route = _twinleaf._parse_route(route)
+        if route not in self._info:
+            raise KeyError(
+                f"no device found at {route} in {self.url}; found {self.routes}. "
+                "Tree.refresh() looks again."
+            )
+        device = self._devices.get(route)
+        if device is None:
+            device = Device(route=route, tree=self)
+            self._devices[route] = device
+        return device
+
+    def __contains__(self, route: object) -> bool:
+        if not isinstance(route, str):
+            return False
+        try:
+            return _twinleaf._parse_route(route) in self._info
+        except ValueError:
+            return False
+
+    def __iter__(self) -> Iterator[Device]:
+        """Opens and yields every device found, in route order."""
+        for route in self.routes:
+            yield self[route]
+
+    def __len__(self) -> int:
+        return len(self._info)
+
+    def find(self, name: str | None = None, serial: str | None = None) -> list[Device]:
+        """Returns the devices whose `dev.name` (ignoring case) and `dev.serial`
+        match every criterion given, in route order."""
+        matches = []
+        for info in self.info:
+            if name is not None and (info.name or "").lower() != name.lower():
+                continue
+            if serial is not None and info.serial != serial:
+                continue
+            matches.append(self[info.route])
+        return matches
+
+    def __repr__(self) -> str:
+        lines = [f"{self.__module__}.{self.__class__.__name__}('{self.url}')"]
+        width = max((len(info.route) for info in self.info), default=0)
+        name_width = max((len(info.name or "?") for info in self.info), default=0)
+        for info in self.info:
+            name = info.name or "?"
+            lines.append(
+                f"  {info.route:<{width}}  {name:<{name_width}}  {info.serial or ''}".rstrip()
+            )
+        if not self._info:
+            lines.append("  (no devices found; Tree.refresh() looks again)")
+        return "\n".join(lines)
+
+
+def _route_sort_key(route: str) -> tuple[int, ...]:
+    return tuple(int(hop) for hop in route.strip("/").split("/") if hop)
