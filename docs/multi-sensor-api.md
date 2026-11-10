@@ -1,7 +1,8 @@
 # Proposal: multiple sensors and synchronized data in the Python API
 
-Status: phases 1 (the tree), 2 (synchronized acquisition) and 3 (unified
-settings) are implemented; phase 4 is a proposal, for review. Written 9 November 2026 against twinleaf 2.0.0 and the VMR-SANDI setup
+Status: all four phases are implemented: the tree, synchronized acquisition,
+unified settings, and resampling with pandas export. The proposal below is
+kept as written; each "as built" section records how the code differs from it. Written 9 November 2026 against twinleaf 2.0.0 and the VMR-SANDI setup
 connected on `/dev/cu.usbmodem14201`.
 
 Phase 1 as built:
@@ -97,6 +98,33 @@ Phase 3 as built, as sketched in section 2 below, plus:
     surveys, captures, partial failures and argument errors.
   - Read-only on the VMR-SANDI: the VMR alone, and the COMM-USB with the VMR,
     whose shared settings are `dev.*` and `rpc.*` only.
+
+Phase 4 as built, with how it differs from section 3 below:
+
+- **`Slice.resample(on, method, *, edges="nan")`** returns a `Slice` again,
+  with every stream on the times of `on`. It is not a separate table type, so
+  `r["/imu"]["accel.z"]` keeps working. `Slice.aligned_on` names the
+  reference stream, and each `StreamSlice.resampled` names its method.
+- **No default method.** `method` is required, either one value or a dict of
+  stream to method. A wrong choice gives a plausible but wrong trace, so the
+  caller has to state it.
+- **Lost data stays lost.** Times where a stream has no value are NaN: before
+  its first row, after its last for "linear", and inside its gaps.
+  `edges="trim"` drops those times instead. Bridging a gap would invent the
+  lost samples.
+- **dtypes:** "previous" keeps a column's dtype when no value is NaN; "linear"
+  gives float64.
+- **pandas** is an optional extra, `twinleaf[pandas]`.
+  - `to_pandas()` gives one wide DataFrame with `(stream, column)` columns
+    for a resampled slice, and a dict of per-stream DataFrames otherwise.
+  - `long=True` gives a tidy frame with `time`, `stream`, `column` and
+    `value`.
+- **Tested:**
+  - On hand-built slices, value by value: edges, trim, gaps, dtypes, methods,
+    errors and the three frame shapes.
+  - On the VMR-SANDI: 5 s of the 10 Hz IMU (linear) and the 4 Hz barometer
+    (previous) onto the 200 Hz vector grid, matching a brute-force
+    computation exactly.
 
 ## What we have to work with
 

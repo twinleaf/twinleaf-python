@@ -26,6 +26,9 @@ dependencies = [
 ]
 readme="README.md"
 
+[project.optional-dependencies]
+pandas = ["pandas>=2.2"]
+
 [project.scripts]
 itl = "twinleaf.itl:interact"
 
