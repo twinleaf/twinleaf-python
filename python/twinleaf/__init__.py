@@ -29,6 +29,7 @@ class Device(_twinleaf._Device):
     ):
         if tree is None:
             tree = connect(url, discover=0)
+        tree._check_open()
         device = super().__new__(cls, None, route, tree._tree)
         # Holding the tree keeps the shared connection, and its cache entry,
         # alive as long as the device.
@@ -531,14 +532,53 @@ class Tree:
 
     Use `twinleaf.connect(url)` to get one. Index it by route to get a
     `Device`: `tree["/0"]`. The devices share the tree's connection.
+    `close()` ends the connection, as does leaving a `with` block:
+
+        with twinleaf.connect(url) as tree:
+            ...
     """
 
     def __init__(self, url: str | Sequence[str] | None = None):
         key = _url_key(url)
+        self._key = key
         self._tree = _twinleaf._Tree(list(key) if key else None)
         self._info: dict[str, DeviceInfo] = {}
         self._devices: dict[str, Device] = {}
         self._discovered = False
+        self._closed = False
+
+    def close(self) -> None:
+        """Ends the connection. The proxy releases the port a few seconds
+        later, once no other client uses it.
+
+        Every `Device` on the connection stops working, including one opened
+        with `twinleaf.Device(url)`, and a running acquisition ends. The next
+        `twinleaf.connect(url)` opens a new connection.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if _trees.get(self._key) is self:
+            del _trees[self._key]
+        self._devices.clear()
+        self._tree._close()
+
+    @property
+    def closed(self) -> bool:
+        """Whether `close()` has ended the connection."""
+        return self._closed
+
+    def __enter__(self) -> "Tree":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError(
+                f"the connection to {self.url} is closed; twinleaf.connect() opens it again"
+            )
 
     @property
     def url(self) -> str:
@@ -547,11 +587,30 @@ class Tree:
 
     def refresh(self, seconds: float = 2.0) -> list[DeviceInfo]:
         """Listens for `seconds` for the tree's devices, and asks each for its
-        name and serial. Returns what it found."""
+        name and serial. Returns what it found.
+
+        `tree[route]` gives a new `Device` afterwards where the device at
+        `route` was replaced by another. A `Device` or `Unified` made before
+        then still describes the old one.
+        """
+        self._check_open()
         found = self._tree._discover(seconds)
+        previous = self._info
         self._info = {
             route: DeviceInfo(route, name, serial) for route, name, serial in found
         }
+        # A cached Device describes the device that was at its route. Forget
+        # it when that device has gone or another has taken its place.
+        for route in list(self._devices):
+            now, before = self._info.get(route), previous.get(route)
+            if now is None or (
+                before is not None
+                and (
+                    _differs(now.name, before.name)
+                    or _differs(now.serial, before.serial)
+                )
+            ):
+                del self._devices[route]
         self._discovered = True
         return self.info
 
@@ -567,6 +626,7 @@ class Tree:
 
     def __getitem__(self, route: str) -> Device:
         """Returns the device at `route`, such as "/0", opening it on first use."""
+        self._check_open()
         route = _twinleaf._parse_route(route)
         if route not in self._info:
             raise KeyError(
@@ -608,27 +668,30 @@ class Tree:
         return matches
 
     def acquire(
-        self, streams: Sequence[str] | None = None, *, retention: float = 60.0
+        self, streams: str | Sequence[str] | None = None, *, retention: float = 60.0
     ) -> Acquisition:
-        """Starts buffering every stream of the tree, or only `streams`, such
-        as `["/0/vector", "/imu"]`, keeping the latest `retention` seconds of
-        each. Use it as a context manager, or close it when done:
+        """Starts buffering every enabled stream of the tree, or only
+        `streams`, such as `["/0/vector", "/imu"]`, keeping the latest
+        `retention` seconds of each. A stream that is not enabled on its
+        device is buffered only when named, or once it starts. Use it as a
+        context manager, or close it when done:
 
             with tree.acquire() as acq:
                 acq.wait(5)
                 s = acq.window(5)   # the same 5 s of device time from every stream
         """
+        self._check_open()
         return Acquisition(self, streams, retention)
 
     def samples(
         self,
         seconds: float,
-        streams: Sequence[str] | None = None,
+        streams: str | Sequence[str] | None = None,
         *,
         timeout: float | None = None,
         allow_mixed_timebases: bool = False,
     ) -> Slice:
-        """Acquires `seconds` of every stream, or of `streams`, and returns
+        """Acquires `seconds` of every enabled stream, or of `streams`, and returns
         them as one `Slice` over the same interval of device time. See
         `Acquisition.window()`."""
         with self.acquire(streams, retention=max(2 * seconds, seconds + 10)) as acq:
@@ -651,7 +714,8 @@ class Tree:
         return Unified(members)
 
     def __repr__(self) -> str:
-        lines = [f"{self.__module__}.{self.__class__.__name__}('{self.url}')"]
+        state = ", closed" if self._closed else ""
+        lines = [f"{self.__module__}.{self.__class__.__name__}('{self.url}'{state})"]
         width = max((len(info.route) for info in self.info), default=0)
         name_width = max((len(info.name or "?") for info in self.info), default=0)
         for info in self.info:
@@ -664,13 +728,27 @@ class Tree:
         return "\n".join(lines)
 
 
+def _differs(a: str | None, b: str | None) -> bool:
+    """Whether two answers are known and unequal; no answer decides nothing."""
+    return a is not None and b is not None and a != b
+
+
 def _route_sort_key(route: str) -> tuple[int, ...]:
     return tuple(int(hop) for hop in route.strip("/").split("/") if hop)
 
 
 # Unified devices: several devices of one kind, addressed as one
 class Mixed(dict):
-    """The values of an RPC when the unified devices disagree, keyed by route."""
+    """The values of an RPC when the unified devices disagree, keyed by route.
+
+    It has no truth value, so `if unified.settings.x():` raises instead of
+    passing when the devices disagree. Test `isinstance(value, Mixed)`.
+    """
+
+    def __bool__(self) -> bool:
+        raise ValueError(
+            f"the devices disagree, so the value has no truth value: {dict(self)}"
+        )
 
     def __repr__(self) -> str:
         return f"twinleaf.Mixed({dict.__repr__(self)})"
@@ -851,16 +929,21 @@ class Unified:
     def stream_paths(self, *streams: str) -> list[str]:
         """The paths of the named streams on every device, such as
         `["/0/vector", "/1/vector"]` for "vector". With no names, every stream
-        all the devices have."""
+        that is enabled on all the devices."""
         if not streams:
             per_device = [
-                set(device._get_metadata()["streams"]) for device in self.devices
+                {
+                    name
+                    for name, stream in device._get_metadata()["streams"].items()
+                    if stream["enabled"]
+                }
+                for device in self.devices
             ]
             streams = tuple(sorted(set.intersection(*per_device)))
             if not streams:
                 raise ValueError(
-                    f"the devices at {', '.join(self.routes)} have no stream in "
-                    "common; name the streams to read"
+                    f"the devices at {', '.join(self.routes)} have no enabled "
+                    "stream in common; name the streams to read"
                 )
         paths = []
         for device in self.devices:
@@ -872,16 +955,18 @@ class Unified:
     def samples(
         self,
         seconds: float,
-        streams: Sequence[str] | None = None,
+        streams: str | Sequence[str] | None = None,
         *,
         timeout: float | None = None,
         allow_mixed_timebases: bool = False,
     ) -> Slice:
         """Reads the same `seconds` of device time from the named streams of
-        every device, such as `samples(5, ["vector"])`, or from every stream
+        every device, such as `samples(5, ["vector"])`, or from every enabled stream
         they all have. Devices behind different hubs count on different
         clocks; `allow_mixed_timebases=True` reads each clock's latest window.
         See `Tree.samples()`."""
+        if isinstance(streams, str):
+            streams = [streams]
         paths = self.stream_paths(*(streams or ()))
         return self.tree.samples(
             seconds, paths, timeout=timeout, allow_mixed_timebases=allow_mixed_timebases

@@ -76,6 +76,15 @@ def _stream_path(path: str) -> str:
     return f"/{stream}" if route == "/" else f"{route}/{stream}"
 
 
+def _stream_list(streams: str | Iterable[str] | None) -> list[str] | None:
+    """The streams asked for as a list; one name alone is one stream."""
+    if streams is None:
+        return None
+    if isinstance(streams, str):
+        return [streams]
+    return list(streams)
+
+
 class StreamSlice:
     """One stream's rows within a slice.
 
@@ -100,6 +109,8 @@ class StreamSlice:
             self.units[name] = units
         self.gaps = [Gap(self.path, *gap[1:]) for gap in raw["gaps"]]
         self._gap_ids = [gap[0] for gap in raw["gaps"]]
+        # Seconds, when the slice was cut, since the stream's newest row arrived.
+        self.age: float | None = raw.get("idle")
         # How the rows were resampled onto another stream's times, or None
         # for the stream's own rows.
         self.resampled: str | None = None
@@ -303,6 +314,15 @@ class Slice:
             f"no stream '{path}' in this slice; its streams are {self.paths}"
         )
 
+    def __contains__(self, path: object) -> bool:
+        if not isinstance(path, str):
+            return False
+        try:
+            self[path]
+        except KeyError:
+            return False
+        return True
+
     def __iter__(self) -> Iterator[StreamSlice]:
         return iter(self._streams.values())
 
@@ -349,6 +369,18 @@ class Slice:
         )
 
     @property
+    def age(self) -> float | None:
+        """Seconds, when the slice was cut, since the newest row arrived of
+        the stream heard from least recently.
+
+        It is about the interval between batches of the slowest stream while
+        every stream is running. It keeps growing once a stream stops, and the
+        latest window then stays the same, as it ends where that stream ends.
+        """
+        ages = [stream.age for stream in self if stream.age is not None]
+        return max(ages) if ages else None
+
+    @property
     def host_time_offset(self) -> float | None:
         """Seconds to add to `time` for an estimate of UNIX time.
 
@@ -389,13 +421,14 @@ class Acquisition:
     def __init__(
         self,
         tree: "Tree",
-        streams: Iterable[str] | None = None,
+        streams: str | Iterable[str] | None = None,
         retention: float = 60.0,
     ):
         self.tree = tree
         self.retention = float(retention)
         if not tree._discovered:
             tree.refresh()
+        streams = _stream_list(streams)
         selected = None if streams is None else [_stream_path(p) for p in streams]
         self._acq = tree._tree._acquire(tree.routes, selected, self.retention)
         self._reported_gaps: set[int] = set()
@@ -415,12 +448,17 @@ class Acquisition:
         self.close()
 
     # What is buffered
-    def _infos(self, streams: Iterable[str] | None) -> list[dict]:
+    def _infos(self, streams: str | Iterable[str] | None) -> list[dict]:
         infos = {info["path"]: info for info in self._acq._streams()}
         if streams is None:
+            if not infos:
+                raise NotEnoughData(
+                    f"no stream of {self.tree.url} is enabled; enable one on its "
+                    "device, or name the streams to acquire"
+                )
             return list(infos.values())
         selected = []
-        for path in streams:
+        for path in _stream_list(streams) or []:
             canonical = _stream_path(path)
             if canonical not in infos:
                 raise KeyError(
@@ -462,6 +500,9 @@ class Acquisition:
         stream, or returns None when they are."""
         empty = [info["path"] for info in infos if info["rows"] == 0]
         if empty:
+            disabled = [info["path"] for info in infos if not info["active"]]
+            if disabled:
+                return f"{', '.join(disabled)} is not enabled on its device"
             return f"no samples yet from {', '.join(empty)}"
         for members in self._groups(infos).values():
             end = min(info["last_end"] for info in members)
@@ -481,14 +522,14 @@ class Acquisition:
     def wait(
         self,
         seconds: float,
-        streams: Iterable[str] | None = None,
+        streams: str | Iterable[str] | None = None,
         timeout: float | None = None,
     ) -> None:
         """Waits until the latest `seconds` of every stream are buffered, so
         that `window(seconds)` succeeds. Raises `NotEnoughData` after
         `timeout` seconds, by default `seconds` + 10."""
         self._check_seconds(seconds)
-        streams = list(streams) if streams is not None else None
+        streams = _stream_list(streams)
         deadline = _time.monotonic() + (seconds + 10.0 if timeout is None else timeout)
         while True:
             infos = self._infos(streams)
@@ -516,7 +557,7 @@ class Acquisition:
     def window(
         self,
         seconds: float,
-        streams: Iterable[str] | None = None,
+        streams: str | Iterable[str] | None = None,
         *,
         allow_mixed_timebases: bool = False,
     ) -> Slice:
@@ -528,9 +569,13 @@ class Acquisition:
         Raises `TimebaseMismatch` when the streams count on different clocks,
         unless `allow_mixed_timebases`, which returns each clock's streams over
         that clock's own latest window. Raises `NotEnoughData` when not enough
-        is buffered yet; `wait(seconds)` waits for it.
+        is buffered yet; `wait(seconds)` waits for it. Raises
+        `ConnectionError` once the connection is lost, as the latest window
+        would never change again. `Slice.age` tells a window that has stopped
+        moving because a stream stopped.
         """
         self._check_seconds(seconds)
+        self._check_running()
         infos = self._infos(streams)
         shortfall = self._shortfall(infos, seconds)
         if shortfall is not None:
@@ -552,7 +597,7 @@ class Acquisition:
         self,
         start: float,
         end: float,
-        streams: Iterable[str] | None = None,
+        streams: str | Iterable[str] | None = None,
         *,
         trim: str | None = None,
     ) -> Slice:
@@ -562,7 +607,8 @@ class Acquisition:
         Raises `NotEnoughData` unless every stream covers the whole interval.
         `trim="overlap"` cuts the interval to the part every stream covers
         instead. Raises `TimebaseMismatch` when the streams count on different
-        clocks.
+        clocks. An interval that is buffered stays readable after the
+        connection is lost; one that is not raises `ConnectionError` then.
         """
         if not end > start:
             raise ValueError("end must be after start")
@@ -571,6 +617,7 @@ class Acquisition:
         infos = self._infos(streams)
         empty = [info["path"] for info in infos if info["rows"] == 0]
         if empty:
+            self._check_running()
             raise NotEnoughData(f"no samples yet from {', '.join(empty)}")
         groups = self._groups(infos)
         if len(groups) > 1:
@@ -593,6 +640,7 @@ class Acquisition:
                 )
             # The next row of the stream would end after `end`, so none is missing.
             if info["last_end"] + _period(info) <= end - _EPSILON:
+                self._check_running()
                 raise NotEnoughData(
                     f"{info['path']} has data only up to {info['last_end']:.6f}, before {end:.6f}"
                 )
@@ -604,6 +652,7 @@ class Acquisition:
         intervals: dict[Timebase, tuple[float, float]],
     ) -> Slice:
         streams = []
+        requests: list[tuple[dict, float, float]] = []
         host_offsets: dict[Timebase, float | None] = {}
         for timebase, members in groups.items():
             start, end = intervals[timebase]
@@ -616,11 +665,24 @@ class Acquisition:
                 0.0 if timebase.epoch == "unix" else (min(offsets) if offsets else None)
             )
             for info in members:
-                streams.append(
-                    StreamSlice(
-                        info, self._acq._slice(info["path"], start, end), start, end
-                    )
+                requests.append((info, start, end))
+        # One call cuts every stream at the same moment. Each cut says what
+        # its stream held then, which may be less than `groups` saw.
+        cuts = self._acq._slices(
+            [(info["path"], start, end) for info, start, end in requests]
+        )
+        for (info, start, end), cut in zip(requests, cuts):
+            first_begin = cut["first_begin"]
+            if cut["run"] != info["run"]:
+                raise NotEnoughData(
+                    f"{info['path']} restarted while the slice was being cut"
                 )
+            if first_begin is None or first_begin > start + _EPSILON:
+                raise NotEnoughData(
+                    f"{info['path']} no longer keeps data from {start:.6f}; "
+                    "start the acquisition with a longer retention"
+                )
+            streams.append(StreamSlice(info, cut, start, end))
         self._warn_gaps(streams)
         return Slice(streams, host_offsets)
 

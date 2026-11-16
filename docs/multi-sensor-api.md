@@ -38,9 +38,19 @@ Phase 2 as built, with how it differs from section 3 below:
 - **Known streams:** the streams of every device are learned from metadata
   when the acquisition starts. `wait()` therefore waits for slow streams too,
   instead of only the streams that happened to arrive first.
+- **Enabled streams:** with no streams named, a stream is left out when its
+  segment is not flagged active or its rate is zero, so a disabled stream
+  does not hold up every read. It joins once its first batch arrives. A
+  disabled stream that is named is kept, and reported as not enabled.
 - **`wait(seconds)`** waits until `window(seconds)` would succeed, not for a
   fixed time. It raises `NotEnoughData` after a timeout, naming the stream
-  that is short, such as one that is disabled.
+  that is short.
+- **One cut:** a window's or slice's streams are cut in one call under the
+  buffer's lock. A stream that restarted or dropped rows since the check
+  raises `NotEnoughData` instead of returning fewer rows.
+- **Stale windows:** `window()` raises `ConnectionError` once the proxy is
+  lost; `slice()` still returns an interval that is buffered. `Slice.age`
+  tells a window that stopped moving because one stream stopped.
 - **Selection rules:**
   - Rows are those whose end-of-sample time lies in `(start, end]`, so
     adjacent slices share no row.

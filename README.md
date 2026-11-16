@@ -66,6 +66,8 @@ for device in tree:
 
 The devices of a tree share one connection. `twinleaf.Device(url, route)` also reuses the tree for that `url`, so opening several devices on one port costs one connection. `twinleaf.connect([url1, url2])` mounts several devices as one tree at `/0`, `/1`, …. Discovery listens for two seconds; `tree.refresh()` looks again.
 
+`tree.close()` ends the connection, as does leaving `with twinleaf.connect(url) as tree:`. Every device on the connection stops working, and the port is released a few seconds later.
+
 ### Several devices of one kind
 
 `tree.unify(name)` addresses every device with that `dev.name` as one, like the Twinleaf app's "Unify Matching Sensors":
@@ -79,7 +81,7 @@ mags.settings.vector.data()                 # a survey, with Mixed values where 
 mags.samples(5, ['vector'])                 # the same 5 s of every magnetometer's vector stream
 ```
 
-The unified settings are the RPCs that every device has with the same type; `mags.not_shared` lists the rest. A call is tried on every device. If it fails on some of them, `twinleaf.UnifiedRpcError` is raised, holding the replies and errors by route.
+The unified settings are the RPCs that every device has with the same type; `mags.not_shared` lists the rest. A call is tried on every device. If it fails on some of them, `twinleaf.UnifiedRpcError` is raised, holding the replies and errors by route. A `Mixed` value has no truth value, so `if mags.settings.x():` raises when the devices disagree instead of passing.
 
 ### Synchronized data from several devices
 
@@ -94,7 +96,7 @@ s.timebase                 # the clock every stream counts on
 s.gaps                     # samples lost within the slice
 ```
 
-A stream is named by its device's route and its name: `/imu` on the device at `/`, `/0/vector` on the device at `/0`. Each stream keeps its own rate and its own `time` array; nothing is resampled.
+A stream is named by its device's route and its name: `/imu` on the device at `/`, `/0/vector` on the device at `/0`. Each stream keeps its own rate and its own `time` array; nothing is resampled. With no streams named, every stream that is enabled on its device is read.
 
 For repeated reads, an acquisition buffers every stream in the background:
 
@@ -108,7 +110,8 @@ with tree.acquire(retention=60) as acq:    # keeps the latest 60 s of every stre
 - The interval is in device time, never the time the host received the data. A window ends at the newest time every stream has reached, so slow streams such as `bar` at 4 Hz are complete up to its end. A slice holds the rows whose end-of-sample time lies in `(start, end]`.
 - Streams can only be compared if they count time on the same clock. Sensors behind one hub share the hub's clock. If the requested streams don't share one, `twinleaf.TimebaseMismatch` is raised. `allow_mixed_timebases=True` returns each clock's streams over that clock's latest window instead.
 - `twinleaf.NotEnoughData` says which stream is short when the buffer doesn't cover the interval. That happens just after starting, or after a device restart, which ends a stream's run.
-- Lost samples are listed in `s.gaps` and reported once each with `twinleaf.SampleLossWarning`. A `ConnectionError` is raised if the proxy goes away.
+- Lost samples are listed in `s.gaps` and reported once each with `twinleaf.SampleLossWarning`.
+- A `ConnectionError` is raised by `wait()` and `window()` if the proxy goes away. If one stream stops, the latest window stops moving, as it ends where that stream ends; `s.age` then keeps growing. It is the seconds since the newest row arrived of the stream heard from least recently.
 - Device time is usually the uptime of the device that owns the clock. `s.host_time_offset` estimates the seconds to add for UNIX time.
 
 To put every stream on one time grid, resample onto one stream's times. There is no default method, because the right one depends on the signal:

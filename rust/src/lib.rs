@@ -398,6 +398,13 @@ impl PyTree {
         self.label.clone()
     }
 
+    /// Ends the connection for the tree and every device that shares it.
+    /// Their RPCs then fail and their subscriptions end. Returns at once;
+    /// the port or socket closes soon after.
+    fn _close(&self) {
+        self.connection.close();
+    }
+
     /// Starts buffering the streams of `routes`, or only those named in
     /// `streams`, keeping `retention` seconds of each.
     #[pyo3(signature = (routes, streams=None, retention=60.0))]
@@ -638,6 +645,13 @@ impl PyDevice {
             let stream_view = schema.stream();
             let stream_dict = PyDict::new(py);
             stream_dict.set_item("stream_id", stream_id.to_string())?;
+            // Whether the device is producing samples for the stream.
+            let enabled = stream
+                .segment()
+                .flags()
+                .contains(::twinleaf::proto::data::SegmentFlags::ACTIVE)
+                && stream.rate_hz() > 0.0;
+            stream_dict.set_item("enabled", enabled)?;
 
             let columns_dict = PyDict::new(py);
             for col in schema.columns() {

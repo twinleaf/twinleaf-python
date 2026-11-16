@@ -7,10 +7,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ::twinleaf::data::{Change, ColumnData, SampleBatch, StreamMetadataSnapshot};
 use ::twinleaf::device::{DeviceTree, RecvError};
+use ::twinleaf::proto::data::SegmentFlags;
 use ::twinleaf::proto::DeviceRoute;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -127,6 +128,12 @@ struct Ring {
     /// host UNIX time minus device time, per batch, with the batch's last
     /// device time.
     host_offsets: VecDeque<(f64, f64)>,
+    /// Counts the stream's runs, so a reader can tell that one ended.
+    run: u64,
+    /// Whether the device says it is producing samples for the stream.
+    active: bool,
+    /// When the newest retained row arrived.
+    last_received: Option<Instant>,
 }
 
 impl Ring {
@@ -141,6 +148,9 @@ impl Ring {
             gaps: VecDeque::new(),
             run_break: None,
             host_offsets: VecDeque::new(),
+            run: 0,
+            active: false,
+            last_received: None,
         }
     }
 
@@ -148,6 +158,8 @@ impl Ring {
     fn describe(&mut self, meta: &StreamMetadataSnapshot) {
         self.timebase = Some(Timebase::of(meta));
         self.rate_hz = meta.rate_hz();
+        self.active =
+            meta.segment().flags().contains(SegmentFlags::ACTIVE) && meta.rate_hz() > 0.0;
         self.columns = meta
             .schema()
             .columns()
@@ -165,6 +177,8 @@ impl Ring {
         }
         self.gaps.clear();
         self.host_offsets.clear();
+        self.last_received = None;
+        self.run += 1;
         self.run_break = Some((at, reason));
     }
 
@@ -306,6 +320,8 @@ impl State {
         if let Some(&last) = times.last() {
             ring.host_offsets.push_back((last, host_now - last));
         }
+        ring.active = true;
+        ring.last_received = Some(Instant::now());
         ring.prune(self.retention);
     }
 }
@@ -333,7 +349,9 @@ impl PyAcquisition {
 
     /// Starts buffering `tree`'s streams, or only the paths in `streams`.
     /// The streams of every route in `routes` are described from their
-    /// metadata up front, so they are known before their first batch.
+    /// metadata up front, so they are known before their first batch. With
+    /// no `streams`, a stream its device is not producing samples for is
+    /// left out until its first batch arrives.
     pub fn start(
         py: Python<'_>,
         tree: &DeviceTree,
@@ -384,7 +402,7 @@ impl PyAcquisition {
                 .into_iter()
                 .filter(|(path, _)| only.contains(path))
                 .collect(),
-            None => described,
+            None => described.into_iter().filter(|(_, ring)| ring.active).collect(),
         };
         let state = Arc::new(Mutex::new(State {
             rings,
@@ -445,6 +463,8 @@ impl PyAcquisition {
             }
             info.set_item("rate_hz", ring.rate_hz)?;
             info.set_item("rows", ring.time.len())?;
+            info.set_item("run", ring.run)?;
+            info.set_item("active", ring.active)?;
             info.set_item("first_begin", ring.first_begin())?;
             info.set_item("last_end", ring.time.last().copied())?;
             let columns: Vec<(&str, &str)> = ring
@@ -472,41 +492,52 @@ impl PyAcquisition {
         (state.ended.clone(), state.lagged)
     }
 
-    /// Returns the rows of `path` whose end-of-sample time lies in
-    /// `(start, end]`: their times and each column as little-endian bytes
-    /// with a numpy dtype, and the gaps among them.
-    fn _slice<'py>(
+    /// Cuts several streams at once, so that the cuts are of one moment.
+    /// Each request is a path and an interval; each result holds the rows
+    /// whose end-of-sample time lies in `(start, end]`: their times and each
+    /// column as little-endian bytes with a numpy dtype, and the gaps among
+    /// them. It also holds the stream's run, the interval its rows cover and
+    /// the seconds since its newest row arrived, as they were at the cut.
+    fn _slices<'py>(
         &self,
         py: Python<'py>,
-        path: &str,
-        start: f64,
-        end: f64,
-    ) -> PyResult<Bound<'py, PyDict>> {
+        requests: Vec<(String, f64, f64)>,
+    ) -> PyResult<Bound<'py, PyList>> {
         let state = self.lock();
-        let ring = state
-            .rings
-            .get(path)
-            .ok_or_else(|| PyKeyError::new_err(path.to_string()))?;
-        let lo = ring.time.partition_point(|&t| t <= start);
-        let hi = ring.time.partition_point(|&t| t <= end);
-        let out = PyDict::new(py);
-        let time: Vec<u8> = ring.time[lo..hi].iter().flat_map(|t| t.to_le_bytes()).collect();
-        out.set_item("time", PyBytes::new(py, &time))?;
-        let columns = PyList::empty(py);
-        for column in &ring.columns {
-            let dtype = column.dtype.unwrap_or("<f8");
-            let bytes = &column.bytes[lo * column.size..hi * column.size];
-            columns.append((&column.name, dtype, &column.units, PyBytes::new(py, bytes)))?;
+        let now = Instant::now();
+        let list = PyList::empty(py);
+        for (path, start, end) in &requests {
+            let ring = state
+                .rings
+                .get(path)
+                .ok_or_else(|| PyKeyError::new_err(path.to_string()))?;
+            let lo = ring.time.partition_point(|&t| t <= *start);
+            let hi = ring.time.partition_point(|&t| t <= *end);
+            let out = PyDict::new(py);
+            let time: Vec<u8> = ring.time[lo..hi].iter().flat_map(|t| t.to_le_bytes()).collect();
+            out.set_item("time", PyBytes::new(py, &time))?;
+            let columns = PyList::empty(py);
+            for column in &ring.columns {
+                let dtype = column.dtype.unwrap_or("<f8");
+                let bytes = &column.bytes[lo * column.size..hi * column.size];
+                columns.append((&column.name, dtype, &column.units, PyBytes::new(py, bytes)))?;
+            }
+            out.set_item("columns", columns)?;
+            let gaps: Vec<(u64, f64, f64, u64, u64)> = ring
+                .gaps
+                .iter()
+                .filter(|gap| gap.before > *start && gap.after < *end)
+                .map(|gap| (gap.id, gap.after, gap.before, gap.samples, gap.dropped_batches))
+                .collect();
+            out.set_item("gaps", gaps)?;
+            out.set_item("run", ring.run)?;
+            out.set_item("first_begin", ring.first_begin())?;
+            out.set_item("last_end", ring.time.last().copied())?;
+            let idle = ring.last_received.map(|at| now.duration_since(at).as_secs_f64());
+            out.set_item("idle", idle)?;
+            list.append(out)?;
         }
-        out.set_item("columns", columns)?;
-        let gaps: Vec<(u64, f64, f64, u64, u64)> = ring
-            .gaps
-            .iter()
-            .filter(|gap| gap.before > start && gap.after < end)
-            .map(|gap| (gap.id, gap.after, gap.before, gap.samples, gap.dropped_batches))
-            .collect();
-        out.set_item("gaps", gaps)?;
-        Ok(out)
+        Ok(list)
     }
 
     /// Stops buffering. The retained rows stay readable.
