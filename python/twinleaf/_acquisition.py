@@ -199,13 +199,14 @@ def _resample_column(
     return out
 
 
-class Slice:
+class Slice(Mapping[str, StreamSlice]):
     """The same interval of device time from several streams.
 
-    Index by stream path, such as `s["/0/vector"]` or `s["/imu"]`, or by
-    stream name when only one stream has it: `s["vector"]`. Each stream keeps
-    its own rate and its own `time` array, unless `resample()` puts them on
-    one stream's times.
+    A read-only mapping of stream path to `StreamSlice`: index it by path,
+    such as `s["/0/vector"]` or `s["/imu"]`, or by stream name when only one
+    stream has it: `s["vector"]`. Iterating gives the paths; `values()` and
+    `items()` give the streams. Each stream keeps its own rate and its own
+    `time` array, unless `resample()` puts them on one stream's times.
     """
 
     def __init__(
@@ -256,7 +257,7 @@ class Slice:
             raise ValueError("edges must be 'nan' or 'trim'")
         _ = self.timebase  # raises when the streams mix timebases
         reference = self[on]
-        others = [stream for stream in self if stream.path != reference.path]
+        others = [stream for stream in self.values() if stream.path != reference.path]
         if isinstance(method, str):
             methods = {stream.path: method for stream in others}
         else:
@@ -282,7 +283,7 @@ class Slice:
                 )
             times = times[keep]
         streams = []
-        for stream in self:
+        for stream in self.values():
             if stream.path == reference.path:
                 columns = {
                     name: values[keep] for name, values in stream._columns.items()
@@ -323,8 +324,14 @@ class Slice:
             return False
         return True
 
-    def __iter__(self) -> Iterator[StreamSlice]:
-        return iter(self._streams.values())
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._streams)
+
+    # Slices are compared by identity: their arrays have no single truth value.
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    __hash__ = object.__hash__
 
     def __len__(self) -> int:
         return len(self._streams)
@@ -337,7 +344,7 @@ class Slice:
     @property
     def timebases(self) -> list[Timebase]:
         """Every timebase among the streams, one unless mixed timebases were allowed."""
-        return sorted({stream.timebase for stream in self})
+        return sorted({stream.timebase for stream in self.values()})
 
     @property
     def timebase(self) -> Timebase:
@@ -345,27 +352,45 @@ class Slice:
         timebases = self.timebases
         if len(timebases) != 1:
             raise TimebaseMismatch(
-                f"this slice mixes timebases: {[str(t) for t in timebases]}"
+                f"this slice mixes timebases: {[str(t) for t in timebases]}; "
+                "by_timebase() splits it"
             )
         return timebases[0]
+
+    def by_timebase(self) -> "dict[Timebase, Slice]":
+        """The slice split by clock: each timebase with a slice of the
+        streams that count on it. Each part has one timebase, so its `start`,
+        `end` and `host_time_offset` are defined, which they are not for a
+        slice that mixes timebases."""
+        parts = {}
+        for timebase in self.timebases:
+            members = [s for s in self.values() if s.timebase == timebase]
+            aligned = self._aligned_on
+            if aligned is not None and all(s.path != aligned for s in members):
+                aligned = None
+            parts[timebase] = Slice(
+                members, {timebase: self._host_offsets.get(timebase)}, aligned
+            )
+        return parts
 
     @property
     def start(self) -> float:
         """The start of the slice's interval; rows end after it."""
         _ = self.timebase  # raises when the streams mix timebases
-        return next(iter(self)).start
+        return next(iter(self.values())).start
 
     @property
     def end(self) -> float:
         """The end of the slice's interval; rows end at or before it."""
         _ = self.timebase  # raises when the streams mix timebases
-        return next(iter(self)).end
+        return next(iter(self.values())).end
 
     @property
     def gaps(self) -> list[Gap]:
         """Samples lost within the slice, from every stream."""
         return sorted(
-            (gap for stream in self for gap in stream.gaps), key=lambda g: g.after
+            (gap for stream in self.values() for gap in stream.gaps),
+            key=lambda g: g.after,
         )
 
     @property
@@ -377,7 +402,7 @@ class Slice:
         every stream is running. It keeps growing once a stream stops, and the
         latest window then stays the same, as it ends where that stream ends.
         """
-        ages = [stream.age for stream in self if stream.age is not None]
+        ages = [stream.age for stream in self.values() if stream.age is not None]
         return max(ages) if ages else None
 
     @property
@@ -393,7 +418,7 @@ class Slice:
 
     def __repr__(self) -> str:
         lines = ["twinleaf.Slice("]
-        for stream in self:
+        for stream in self.values():
             if stream.resampled:
                 rows = (
                     f"{len(stream)} rows, {stream.resampled} from {stream.rate_hz:g} Hz"
@@ -402,7 +427,7 @@ class Slice:
                 rows = f"{len(stream)} rows at {stream.rate_hz:g} Hz"
             lines.append(f"  {stream.path}: {rows}, {stream.columns}")
         for timebase in self.timebases:
-            members = [s for s in self if s.timebase == timebase]
+            members = [s for s in self.values() if s.timebase == timebase]
             lines.append(
                 f"  ({members[0].start:.6f}, {members[0].end:.6f}] in {timebase}"
             )

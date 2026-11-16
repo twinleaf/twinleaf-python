@@ -27,7 +27,7 @@ Phase 2 as built, with how it differs from section 3 below:
 
 - **API:** `tree.acquire(streams=None, *, retention=60)` returns an
   `Acquisition` with `wait()`, `window()`, `slice()` and `close()`, which
-  also works as a context manager. `tree.samples(seconds, streams)` does all
+  also works as a context manager. `tree.samples(streams, seconds=...)` does all
   of it in one call. It returns a `Slice` of `StreamSlice`s, each with numpy
   `time` and column arrays, `units`, `rate_hz`, `timebase` and `gaps`.
 - **Buffering:** a Rust thread drains `tree.samples()` into one ring per
@@ -48,6 +48,15 @@ Phase 2 as built, with how it differs from section 3 below:
 - **One cut:** a window's or slice's streams are cut in one call under the
   buffer's lock. A stream that restarted or dropped rows since the check
   raises `NotEnoughData` instead of returning fewer rows.
+- **Seconds by name:** `tree.samples(streams, seconds=5)` and
+  `unified.samples("vector", seconds=5)` take the length by keyword, as a
+  bare number beside `samples` reads as a count. `samples(5)` raises with
+  that hint.
+- **Mappings:** `Tree` and `Slice` are read-only mappings, of route to
+  `Device` and of stream path to `StreamSlice`. Iterating gives the keys;
+  `values()` and `items()` give the devices or streams.
+- **`Slice.by_timebase()`** splits a slice that mixes timebases into one
+  slice per clock, each with its own `start`, `end` and `host_time_offset`.
 - **Stale windows:** `window()` raises `ConnectionError` once the proxy is
   lost; `slice()` still returns an interval that is buffered. `Slice.age`
   tells a window that stopped moving because one stream stopped.
@@ -100,7 +109,7 @@ Phase 3 as built, as sketched in section 2 below, plus:
   `RuntimeError`, after every member was tried, with `results` and `errors`
   by route. The same failure on every member, such as an argument of the
   wrong type, raises that error itself.
-- **Samples:** `Unified.samples(seconds, ["vector"])` reads the named streams
+- **Samples:** `Unified.samples("vector", seconds=...)` reads the named streams
   of every member through `Tree.samples`. `stream_paths()` gives their paths.
   Devices behind different hubs need `allow_mixed_timebases=True`.
 - **Tested:**
@@ -230,7 +239,7 @@ hub.settings.sync.data.enable()
 mag.samples.vector(100)                         # unchanged per-device samples
 
 tree.find(name="MAG")           # -> [Device], matched on dev.name / serial / route
-for dev in tree:                # every device, in route order
+for dev in tree.values():       # every device, in route order
     ...
 ```
 

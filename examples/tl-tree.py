@@ -10,7 +10,7 @@ tree = twinleaf.connect(url)
 print(tree)
 print()
 
-for device in tree:
+for device in tree.values():
     name = device.settings.dev.name()
     print(f"{device._route} {name}")
     for stream in device._get_metadata()["streams"]:

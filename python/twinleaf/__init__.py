@@ -1,5 +1,5 @@
 import weakref
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, NamedTuple
 
 from twinleaf import _twinleaf
@@ -526,12 +526,14 @@ def connect(url: str | Sequence[str] | None = None, *, discover: float = 2.0) ->
     return tree
 
 
-class Tree:
+class Tree(Mapping[str, Device]):
     """Every device reachable through one connection, such as a hub and the
     sensors behind it.
 
-    Use `twinleaf.connect(url)` to get one. Index it by route to get a
-    `Device`: `tree["/0"]`. The devices share the tree's connection.
+    Use `twinleaf.connect(url)` to get one. It is a read-only mapping of
+    route to `Device`: index it by route, `tree["/0"]`. Iterating gives the
+    routes; `values()` and `items()` give the devices, opening each on first
+    use. The devices share the tree's connection.
     `close()` ends the connection, as does leaving a `with` block:
 
         with twinleaf.connect(url) as tree:
@@ -647,10 +649,16 @@ class Tree:
         except ValueError:
             return False
 
-    def __iter__(self) -> Iterator[Device]:
-        """Opens and yields every device found, in route order."""
-        for route in self.routes:
-            yield self[route]
+    def __iter__(self) -> Iterator[str]:
+        """The routes of the devices found, in order."""
+        return iter(self.routes)
+
+    # Trees are compared by identity; comparing as mappings would open every
+    # device.
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    __hash__ = object.__hash__
 
     def __len__(self) -> int:
         return len(self._info)
@@ -685,15 +693,21 @@ class Tree:
 
     def samples(
         self,
-        seconds: float,
         streams: str | Sequence[str] | None = None,
         *,
+        seconds: float | None = None,
         timeout: float | None = None,
         allow_mixed_timebases: bool = False,
     ) -> Slice:
         """Acquires `seconds` of every enabled stream, or of `streams`, and returns
         them as one `Slice` over the same interval of device time. See
-        `Acquisition.window()`."""
+        `Acquisition.window()`.
+
+        The length is in seconds and has to be named, `samples(seconds=5)`,
+        as the streams of a tree have different rates. `device.samples`
+        counts samples instead.
+        """
+        seconds = _check_seconds(streams, seconds)
         with self.acquire(streams, retention=max(2 * seconds, seconds + 10)) as acq:
             acq.wait(seconds, timeout=timeout)
             return acq.window(seconds, allow_mixed_timebases=allow_mixed_timebases)
@@ -728,6 +742,19 @@ class Tree:
         return "\n".join(lines)
 
 
+def _check_seconds(streams: object, seconds: float | None) -> float:
+    """Returns the length asked for, which has to be named: `samples(5)`
+    would read as five samples."""
+    if isinstance(streams, (int, float)):
+        raise TypeError(
+            f"samples() takes its length by name: samples(seconds={streams}). "
+            "A tree's streams have different rates, so it does not count samples."
+        )
+    if seconds is None:
+        raise TypeError("samples() needs its length in seconds: samples(seconds=5)")
+    return seconds
+
+
 def _differs(a: str | None, b: str | None) -> bool:
     """Whether two answers are known and unequal; no answer decides nothing."""
     return a is not None and b is not None and a != b
@@ -755,8 +782,10 @@ class Mixed(dict):
 
 
 class UnifiedRpcError(RuntimeError):
-    """An RPC failed on some of the unified devices. It was tried on every
-    device; `results` holds the replies, and `errors` the failures, by route."""
+    """An RPC failed on some or all of the unified devices. It was tried on
+    every device; `results` holds the replies, and `errors` the failures, by
+    route. An argument that is refused before anything is sent raises its own
+    `TypeError` or `ValueError` instead."""
 
     def __init__(
         self, message: str, results: dict[str, Any], errors: dict[str, Exception]
@@ -836,12 +865,16 @@ class _UnifiedRpc(_UnifiedNode):
                 errors[route] = error
         if errors:
             first = next(iter(errors.values()))
-            if not results and all(
-                type(error) is type(first) and str(error) == str(first)
-                for error in errors.values()
+            if (
+                not results
+                and isinstance(first, (TypeError, ValueError, AssertionError))
+                and all(
+                    type(error) is type(first) and str(error) == str(first)
+                    for error in errors.values()
+                )
             ):
-                # The same failure everywhere, such as an argument of the wrong
-                # type: it is not about any one device.
+                # The same rejected argument everywhere: it was refused before
+                # anything was sent, so it is not about any one device.
                 raise first
             failed = "; ".join(f"{route}: {error}" for route, error in errors.items())
             done = f"; it succeeded on {', '.join(results)}" if results else ""
@@ -954,22 +987,26 @@ class Unified:
 
     def samples(
         self,
-        seconds: float,
         streams: str | Sequence[str] | None = None,
         *,
+        seconds: float | None = None,
         timeout: float | None = None,
         allow_mixed_timebases: bool = False,
     ) -> Slice:
         """Reads the same `seconds` of device time from the named streams of
-        every device, such as `samples(5, ["vector"])`, or from every enabled stream
+        every device, such as `samples("vector", seconds=5)`, or from every enabled stream
         they all have. Devices behind different hubs count on different
         clocks; `allow_mixed_timebases=True` reads each clock's latest window.
         See `Tree.samples()`."""
+        seconds = _check_seconds(streams, seconds)
         if isinstance(streams, str):
             streams = [streams]
         paths = self.stream_paths(*(streams or ()))
         return self.tree.samples(
-            seconds, paths, timeout=timeout, allow_mixed_timebases=allow_mixed_timebases
+            paths,
+            seconds=seconds,
+            timeout=timeout,
+            allow_mixed_timebases=allow_mixed_timebases,
         )
 
     def __iter__(self) -> Iterator[Device]:

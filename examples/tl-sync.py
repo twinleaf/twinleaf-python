@@ -20,9 +20,9 @@ tree = twinleaf.connect(url)
 print(tree)
 print()
 
-s = tree.samples(seconds, streams)
+s = tree.samples(streams, seconds=seconds)
 print(f"{seconds:g} s of {s.timebase}, from {s.start:.6f} to {s.end:.6f}")
-for stream in s:
+for stream in s.values():
     print(f"{stream.path}: {len(stream)} rows at {stream.rate_hz:g} Hz")
     for column in stream.columns:
         values = stream[column]

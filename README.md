@@ -60,8 +60,8 @@ hub = tree['/']
 mag.settings.vector.data.decimation()
 hub.samples.imu(10)
 tree.find(name='MAG')              # devices by dev.name, or serial=...
-for device in tree:
-    print(device)
+for route, device in tree.items():
+    print(route, device)
 ```
 
 The devices of a tree share one connection. `twinleaf.Device(url, route)` also reuses the tree for that `url`, so opening several devices on one port costs one connection. `twinleaf.connect([url1, url2])` mounts several devices as one tree at `/0`, `/1`, …. Discovery listens for two seconds; `tree.refresh()` looks again.
@@ -78,17 +78,17 @@ mags.settings.vector.data.decimation(8)     # writes to every magnetometer
 mags.settings.vector.data.decimation()      # 8 if every magnetometer agrees, else
                                             # twinleaf.Mixed({'/0': 8, '/1': 4})
 mags.settings.vector.data()                 # a survey, with Mixed values where they differ
-mags.samples(5, ['vector'])                 # the same 5 s of every magnetometer's vector stream
+mags.samples('vector', seconds=5)           # the same 5 s of every magnetometer's vector stream
 ```
 
-The unified settings are the RPCs that every device has with the same type; `mags.not_shared` lists the rest. A call is tried on every device. If it fails on some of them, `twinleaf.UnifiedRpcError` is raised, holding the replies and errors by route. A `Mixed` value has no truth value, so `if mags.settings.x():` raises when the devices disagree instead of passing.
+The unified settings are the RPCs that every device has with the same type; `mags.not_shared` lists the rest. A call is tried on every device. If it fails on any of them, `twinleaf.UnifiedRpcError` is raised, holding the replies and errors by route. A `Mixed` value has no truth value, so `if mags.settings.x():` raises when the devices disagree instead of passing.
 
 ### Synchronized data from several devices
 
 Samples read from two devices with separate `samples(n)` calls cover different time intervals. To get the same interval from several streams, read them from the tree:
 
 ```python
-s = tree.samples(5, ['/0/vector', '/imu', '/bar'])    # the same 5 s of every stream
+s = tree.samples(['/0/vector', '/imu', '/bar'], seconds=5)    # the same 5 s of every stream
 s['/0/vector'].time        # numpy array of end-of-sample times, in device seconds
 s['/0/vector']['x']        # numpy array of vector.x, in nT
 s['/imu']['accel.z']
@@ -96,7 +96,7 @@ s.timebase                 # the clock every stream counts on
 s.gaps                     # samples lost within the slice
 ```
 
-A stream is named by its device's route and its name: `/imu` on the device at `/`, `/0/vector` on the device at `/0`. Each stream keeps its own rate and its own `time` array; nothing is resampled. With no streams named, every stream that is enabled on its device is read.
+The length is given in seconds and by name, as the streams have different rates; `device.samples.vector(10)` counts samples instead. A slice is a mapping of stream path to stream, so `s.items()` and `s.values()` work as on a dict. A stream is named by its device's route and its name: `/imu` on the device at `/`, `/0/vector` on the device at `/0`. Each stream keeps its own rate and its own `time` array; nothing is resampled. With no streams named, every stream that is enabled on its device is read.
 
 For repeated reads, an acquisition buffers every stream in the background:
 
@@ -108,7 +108,7 @@ with tree.acquire(retention=60) as acq:    # keeps the latest 60 s of every stre
 ```
 
 - The interval is in device time, never the time the host received the data. A window ends at the newest time every stream has reached, so slow streams such as `bar` at 4 Hz are complete up to its end. A slice holds the rows whose end-of-sample time lies in `(start, end]`.
-- Streams can only be compared if they count time on the same clock. Sensors behind one hub share the hub's clock. If the requested streams don't share one, `twinleaf.TimebaseMismatch` is raised. `allow_mixed_timebases=True` returns each clock's streams over that clock's latest window instead.
+- Streams can only be compared if they count time on the same clock. Sensors behind one hub share the hub's clock. If the requested streams don't share one, `twinleaf.TimebaseMismatch` is raised. `allow_mixed_timebases=True` returns each clock's streams over that clock's latest window instead, and `s.by_timebase()` splits such a slice by clock.
 - `twinleaf.NotEnoughData` says which stream is short when the buffer doesn't cover the interval. That happens just after starting, or after a device restart, which ends a stream's run.
 - Lost samples are listed in `s.gaps` and reported once each with `twinleaf.SampleLossWarning`.
 - A `ConnectionError` is raised by `wait()` and `window()` if the proxy goes away. If one stream stops, the latest window stops moving, as it ends where that stream ends; `s.age` then keeps growing. It is the seconds since the newest row arrived of the stream heard from least recently.
