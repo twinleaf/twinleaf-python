@@ -57,6 +57,13 @@ Phase 2 as built, with how it differs from section 3 below:
   `values()` and `items()` give the devices or streams.
 - **`Slice.by_timebase()`** splits a slice that mixes timebases into one
   slice per clock, each with its own `start`, `end` and `host_time_offset`.
+- **Stream names:** a name with no slash, such as `vector`, is the one
+  stream with that name, in `acquire()`, `wait()`, `window()`, `slice()` and
+  `s[...]` alike, and raises when several devices have it. Anything with a
+  slash is a path. In `Unified.samples()` a name means that stream of every
+  device.
+- **One object per device:** `Device(url, route)` and `tree[route]` return
+  the same object.
 - **Stale windows:** `window()` raises `ConnectionError` once the proxy is
   lost; `slice()` still returns an interval that is buffered. `Slice.age`
   tells a window that stopped moving because one stream stopped.
@@ -131,8 +138,12 @@ Phase 4 as built, with how it differs from section 3 below:
   its first row, after its last for "linear", and inside its gaps.
   `edges="trim"` drops those times instead. Bridging a gap would invent the
   lost samples.
-- **dtypes:** "previous" keeps a column's dtype when no value is NaN; "linear"
-  gives float64.
+- **dtypes** depend on the column, the method and the edges, never on the
+  data. "linear" gives float64. "previous" keeps a float column's dtype and
+  makes any other column float64, so that it can hold NaN; with
+  `edges="trim"` it keeps every dtype.
+- **Read-only arrays:** the arrays of a slice are read-only, resampled or
+  not.
 - **Tested:**
   - On hand-built slices, value by value: edges, trim, gaps, dtypes, methods,
     and errors.

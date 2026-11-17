@@ -78,28 +78,38 @@ impl ColumnBuf {
     /// Appends one value. Returns false if its type differs from the
     /// column's, which only a change of schema causes.
     fn push(&mut self, value: ColumnData) -> bool {
-        let (dtype, bytes): (&'static str, Vec<u8>) = match value {
-            ColumnData::I8(x) => ("i1", x.to_le_bytes().to_vec()),
-            ColumnData::U8(x) => ("u1", x.to_le_bytes().to_vec()),
-            ColumnData::I16(x) => ("<i2", x.to_le_bytes().to_vec()),
-            ColumnData::U16(x) => ("<u2", x.to_le_bytes().to_vec()),
-            ColumnData::I32(x) => ("<i4", x.to_le_bytes().to_vec()),
-            ColumnData::U32(x) => ("<u4", x.to_le_bytes().to_vec()),
-            ColumnData::I64(x) => ("<i8", x.to_le_bytes().to_vec()),
-            ColumnData::U64(x) => ("<u8", x.to_le_bytes().to_vec()),
-            ColumnData::F32(x) => ("<f4", x.to_le_bytes().to_vec()),
-            ColumnData::F64(x) => ("<f8", x.to_le_bytes().to_vec()),
-            _ => ("<f8", f64::NAN.to_le_bytes().to_vec()),
+        // The value's bytes go through a buffer on the stack, so that a row
+        // costs no allocation.
+        let mut buffer = [0u8; 8];
+        macro_rules! le {
+            ($dtype:literal, $x:expr) => {{
+                let bytes = $x.to_le_bytes();
+                buffer[..bytes.len()].copy_from_slice(&bytes);
+                ($dtype, bytes.len())
+            }};
+        }
+        let (dtype, size): (&'static str, usize) = match value {
+            ColumnData::I8(x) => le!("i1", x),
+            ColumnData::U8(x) => le!("u1", x),
+            ColumnData::I16(x) => le!("<i2", x),
+            ColumnData::U16(x) => le!("<u2", x),
+            ColumnData::I32(x) => le!("<i4", x),
+            ColumnData::U32(x) => le!("<u4", x),
+            ColumnData::I64(x) => le!("<i8", x),
+            ColumnData::U64(x) => le!("<u8", x),
+            ColumnData::F32(x) => le!("<f4", x),
+            ColumnData::F64(x) => le!("<f8", x),
+            _ => le!("<f8", f64::NAN),
         };
         match self.dtype {
             None => {
                 self.dtype = Some(dtype);
-                self.size = bytes.len();
+                self.size = size;
             }
             Some(current) if current != dtype => return false,
             Some(_) => {}
         }
-        self.bytes.extend_from_slice(&bytes);
+        self.bytes.extend_from_slice(&buffer[..size]);
         true
     }
 }
@@ -326,6 +336,25 @@ impl State {
     }
 }
 
+/// The times as the bytes of a little-endian float64 array.
+#[cfg(target_endian = "little")]
+fn time_bytes<'py>(py: Python<'py>, times: &[f64]) -> Bound<'py, PyBytes> {
+    // SAFETY: an f64 slice is `8 * len` initialized bytes with no padding,
+    // u8 has no alignment requirement, and the borrow of `times` outlives
+    // the view. On a little-endian host those bytes are the `<f8` encoding.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(times.as_ptr().cast::<u8>(), std::mem::size_of_val(times))
+    };
+    PyBytes::new(py, bytes)
+}
+
+/// The times as the bytes of a little-endian float64 array.
+#[cfg(not(target_endian = "little"))]
+fn time_bytes<'py>(py: Python<'py>, times: &[f64]) -> Bound<'py, PyBytes> {
+    let bytes: Vec<u8> = times.iter().flat_map(|t| t.to_le_bytes()).collect();
+    PyBytes::new(py, &bytes)
+}
+
 fn host_unix_now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -386,6 +415,35 @@ impl PyAcquisition {
             rings
         });
 
+        // A name with no slash is the one stream of the tree with that name.
+        let streams = match streams {
+            Some(names) => Some(
+                names
+                    .into_iter()
+                    .map(|name| {
+                        if name.contains('/') {
+                            return Ok(name);
+                        }
+                        let named: Vec<&String> = described
+                            .iter()
+                            .filter(|(_, ring)| ring.stream == name)
+                            .map(|(path, _)| path)
+                            .collect();
+                        match named.as_slice() {
+                            [path] => Ok((*path).clone()),
+                            [] => Err(PyKeyError::new_err(format!(
+                                "no stream named '{name}' in this tree; its streams are {:?}",
+                                described.keys().collect::<Vec<_>>()
+                            ))),
+                            _ => Err(PyKeyError::new_err(format!(
+                                "several streams are named '{name}': {named:?}; give its path"
+                            ))),
+                        }
+                    })
+                    .collect::<PyResult<Vec<String>>>()?,
+            ),
+            None => None,
+        };
         let only = streams.map(|paths| paths.into_iter().collect::<BTreeSet<_>>());
         if let Some(only) = &only {
             let unknown: Vec<&String> =
@@ -514,8 +572,7 @@ impl PyAcquisition {
             let lo = ring.time.partition_point(|&t| t <= *start);
             let hi = ring.time.partition_point(|&t| t <= *end);
             let out = PyDict::new(py);
-            let time: Vec<u8> = ring.time[lo..hi].iter().flat_map(|t| t.to_le_bytes()).collect();
-            out.set_item("time", PyBytes::new(py, &time))?;
+            out.set_item("time", time_bytes(py, &ring.time[lo..hi]))?;
             let columns = PyList::empty(py);
             for column in &ring.columns {
                 let dtype = column.dtype.unwrap_or("<f8");

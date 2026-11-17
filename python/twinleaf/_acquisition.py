@@ -7,6 +7,7 @@ same clock.
 """
 
 import copy
+import os
 import time as _time
 import warnings
 from collections.abc import Iterable, Iterator, Mapping
@@ -76,6 +77,32 @@ def _stream_path(path: str) -> str:
     return f"/{stream}" if route == "/" else f"{route}/{stream}"
 
 
+def _find_stream(name: str, streams: Mapping[str, str], where: str) -> str:
+    """Returns the path of the stream `name` asks for among `streams`, a
+    mapping of path to stream name. A name with no slash, such as `vector`,
+    is the one stream with that name; anything else is a path, such as
+    `/0/vector`, or `/imu` for a stream of the root device."""
+    name = name.strip()
+    if "/" not in name:
+        named = [path for path, stream in streams.items() if stream == name]
+        if len(named) == 1:
+            return named[0]
+        if named:
+            raise KeyError(
+                f"several streams are named '{name}' in {where}: {named}; give its path"
+            )
+        raise KeyError(
+            f"no stream named '{name}' in {where}; its streams are {list(streams)}"
+        )
+    try:
+        canonical = _stream_path(name)
+    except ValueError:
+        canonical = name
+    if canonical in streams:
+        return canonical
+    raise KeyError(f"no stream '{name}' in {where}; its streams are {list(streams)}")
+
+
 def _stream_list(streams: str | Iterable[str] | None) -> list[str] | None:
     """The streams asked for as a list; one name alone is one stream."""
     if streams is None:
@@ -90,7 +117,8 @@ class StreamSlice:
 
     `time` holds each row's end-of-sample time in seconds of the stream's
     `timebase`. Index by column name, with or without the stream prefix:
-    `s["x"]` or `s["vector.x"]`.
+    `s["x"]` or `s["vector.x"]`. The arrays are read-only; copy one to
+    change it.
     """
 
     def __init__(self, info: dict, raw: dict, start: float, end: float):
@@ -120,6 +148,11 @@ class StreamSlice:
     ) -> "StreamSlice":
         """A copy with other rows, keeping the stream's description."""
         derived = copy.copy(self)
+        derived.units = dict(self.units)
+        derived.gaps = list(self.gaps)
+        # Read-only, as the arrays of a slice that was not resampled are.
+        for array in (time, *columns.values()):
+            array.flags.writeable = False
         derived.time = time
         derived._columns = columns
         derived.resampled = resampled
@@ -185,12 +218,17 @@ def _resample_column(
     times: np.ndarray,
     method: str,
     defined: np.ndarray,
+    trimmed: bool,
 ) -> np.ndarray:
+    """The dtype of the result depends on the column, the method and the
+    edges only, never on the data."""
     if method == "previous":
         index = np.searchsorted(t, times, side="right") - 1
-        if defined.all():
-            return values[index]  # every row has a value: keep the column's dtype
-        out = np.full(len(times), np.nan)
+        if trimmed:
+            return values[index]  # every time has a value: keep any dtype
+        # A float column holds NaN in its own dtype; any other becomes float64.
+        dtype = values.dtype if values.dtype.kind == "f" else np.float64
+        out = np.full(len(times), np.nan, dtype=dtype)
         out[defined] = values[index[defined]]
         return out
     out = np.full(len(times), np.nan)
@@ -203,8 +241,8 @@ class Slice(Mapping[str, StreamSlice]):
     """The same interval of device time from several streams.
 
     A read-only mapping of stream path to `StreamSlice`: index it by path,
-    such as `s["/0/vector"]` or `s["/imu"]`, or by stream name when only one
-    stream has it: `s["vector"]`. Iterating gives the paths; `values()` and
+    such as `s["/0/vector"]` or `s["/imu"]`, or by a stream's name alone
+    when only one stream has it: `s["vector"]`. Iterating gives the paths; `values()` and
     `items()` give the streams. Each stream keeps its own rate and its own
     `time` array, unless `resample()` puts them on one stream's times.
     """
@@ -249,9 +287,21 @@ class Slice(Mapping[str, StreamSlice]):
         Where a stream has no value, the result is NaN: before its first row,
         after its last row for "linear", or inside one of its gaps.
         `edges="trim"` drops those times instead, so every stream has a value
-        at every remaining time. "previous" keeps a column's dtype when no
-        value is NaN. Every stream keeps its source `rate_hz`, and its
-        `resampled` attribute names the method.
+        at every remaining time.
+
+        - dtypes: "linear" gives float64. "previous" keeps a float column's
+          dtype, and makes any other column float64 so that it can hold NaN.
+          With `edges="trim"`, "previous" keeps every dtype, which also keeps
+          64-bit integers exact.
+        - A method applies to every column of its stream. "linear" also
+          interpolates integer columns such as counters and status flags;
+          use "previous" for a stream that has them.
+        - Resampling a fast stream onto a slower one takes its value at each
+          time and does not average, so a signal above half the slower rate
+          aliases. Filter or decimate it on the device first.
+        - Every stream keeps its source `rate_hz`, and its `resampled`
+          attribute names the method. `start` and `end` stay the interval
+          the slice was cut for, also after `edges="trim"`.
         """
         if edges not in ("nan", "trim"):
             raise ValueError("edges must be 'nan' or 'trim'")
@@ -288,32 +338,22 @@ class Slice(Mapping[str, StreamSlice]):
                 columns = {
                     name: values[keep] for name, values in stream._columns.items()
                 }
-                streams.append(stream._derived(times, columns, None))
+                streams.append(stream._derived(times.copy(), columns, None))
                 continue
             m = methods[stream.path]
             mask = defined[stream.path][keep]
             columns = {
-                name: _resample_column(stream.time, values, times, m, mask)
+                name: _resample_column(
+                    stream.time, values, times, m, mask, edges == "trim"
+                )
                 for name, values in stream._columns.items()
             }
             streams.append(stream._derived(times, columns, m))
         return Slice(streams, self._host_offsets, aligned_on=reference.path)
 
     def __getitem__(self, path: str) -> StreamSlice:
-        if path in self._streams:
-            return self._streams[path]
-        named = [s for s in self._streams.values() if s.stream == path.strip("/")]
-        if len(named) == 1:
-            return named[0]
-        try:
-            canonical = _stream_path(path)
-        except ValueError:
-            canonical = path
-        if canonical in self._streams:
-            return self._streams[canonical]
-        raise KeyError(
-            f"no stream '{path}' in this slice; its streams are {self.paths}"
-        )
+        names = {p: stream.stream for p, stream in self._streams.items()}
+        return self._streams[_find_stream(path, names, "this slice")]
 
     def __contains__(self, path: object) -> bool:
         if not isinstance(path, str):
@@ -454,7 +494,13 @@ class Acquisition:
         if not tree._discovered:
             tree.refresh()
         streams = _stream_list(streams)
-        selected = None if streams is None else [_stream_path(p) for p in streams]
+        # A name with no slash is the one stream of the tree with that name,
+        # which the extension finds once it knows the tree's streams.
+        selected = (
+            None
+            if streams is None
+            else [p.strip() if "/" not in p else _stream_path(p) for p in streams]
+        )
         self._acq = tree._tree._acquire(tree.routes, selected, self.retention)
         self._reported_gaps: set[int] = set()
         self._closed = False
@@ -482,20 +528,23 @@ class Acquisition:
                     "device, or name the streams to acquire"
                 )
             return list(infos.values())
-        selected = []
-        for path in _stream_list(streams) or []:
-            canonical = _stream_path(path)
-            if canonical not in infos:
-                raise KeyError(
-                    f"no stream '{path}' in this acquisition; its streams are {list(infos)}"
-                )
-            selected.append(infos[canonical])
+        names = {path: info["stream"] for path, info in infos.items()}
+        selected = [
+            infos[_find_stream(path, names, "this acquisition")]
+            for path in _stream_list(streams) or []
+        ]
         return selected
 
     @property
     def streams(self) -> list[str]:
         """The paths of every stream being buffered."""
         return [info["path"] for info in self._acq._streams()]
+
+    @property
+    def dropped_batches(self) -> int:
+        """How many batches the acquisition dropped because it fell behind.
+        Each stream's share is also listed among its slices' `gaps`."""
+        return self._acq._status()[1]
 
     def _check_running(self) -> None:
         ended, _ = self._acq._status()
@@ -562,6 +611,10 @@ class Acquisition:
             if shortfall is None:
                 return
             self._check_running()
+            if self._closed:
+                raise NotEnoughData(
+                    f"the acquisition is closed, and {shortfall}; no more will arrive"
+                )
             if _time.monotonic() >= deadline:
                 raise NotEnoughData(
                     f"waited for {seconds:g} s of every stream, but {shortfall}. "
@@ -725,7 +778,8 @@ class Acquisition:
                     f"{gap.stream} lost {gap.samples} samples between {gap.after:.6f} and "
                     f"{gap.before:.6f}: {cause}",
                     SampleLossWarning,
-                    stacklevel=4,
+                    # Attributed to the caller's line, however it got here.
+                    skip_file_prefixes=(os.path.dirname(__file__),),
                 )
 
     def __repr__(self) -> str:

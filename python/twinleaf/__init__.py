@@ -1,3 +1,4 @@
+import threading
 import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, NamedTuple
@@ -20,29 +21,42 @@ class Device(_twinleaf._Device):
     `url` names the device, or the default device when it is None. Devices
     opened with the same `url` share one connection, the `Tree` that
     `twinleaf.connect(url)` returns, which is available as `device.tree`.
+    `Device(url, route)` and `tree[route]` are the same object.
     """
 
     tree: "Tree"
+    _instantiated: bool
 
     def __new__(
         cls, url=None, route=None, announce=False, instantiate=True, *, tree=None
     ):
         if tree is None:
             tree = connect(url, discover=0)
+        elif url is not None:
+            raise TypeError("give Device a url or a tree, not both")
         tree._check_open()
+        key = _twinleaf._parse_route(route or "/")
+        cached = tree._devices.get(key)
+        if type(cached) is cls:
+            return cached
         device = super().__new__(cls, None, route, tree._tree)
         # Holding the tree keeps the shared connection, and its cache entry,
         # alive as long as the device.
         device.tree = tree
+        device._instantiated = False
+        tree._devices.setdefault(key, device)
         return device
 
     def __init__(
         self, url=None, route=None, announce=False, instantiate=True, *, tree=None
     ):
+        if self._instantiated:
+            return  # the tree's device for this route, already set up
         super().__init__()
         if instantiate:
             self._instantiate_rpcs()
             self._instantiate_samples(announce)
+            self._instantiated = True
 
     def __repr__(self):
         try:
@@ -351,7 +365,7 @@ class _Rpc(_RpcNode):
 
         match self._type:
             case t if t is bool:
-                if arg is not None and not (isinstance(arg, bool) or arg in (0, 1)):
+                if arg is not None and (isinstance(arg, float) or arg not in (0, 1)):
                     raise TypeError(f"{self.__name__} expects True or False")
                 value = None if arg is None else int(arg)
                 return bool(
@@ -494,8 +508,8 @@ def _url_key(url: str | Sequence[str] | None) -> tuple[str, ...]:
     if url is None:
         return ()
     if isinstance(url, str):
-        return (url,)
-    return tuple(url)
+        return (url.strip(),)
+    return tuple(u.strip() for u in url)
 
 
 # One live Tree per URL, so every Device opened on a URL shares its connection.
@@ -505,22 +519,27 @@ _trees: "weakref.WeakValueDictionary[tuple[str, ...], Tree]" = (
 )
 
 
+_connect_lock = threading.Lock()
+
+
 def connect(url: str | Sequence[str] | None = None, *, discover: float = 2.0) -> "Tree":
     """Connects to a device tree and returns it.
 
     `url` names a device, such as `serial:///dev/ttyACM0`, or the default
     device when it is None. A list of URLs mounts each device at `/0`, `/1`,
     and so on, as one tree. Calls with the same `url` return the same Tree
-    while it is in use.
+    while it is in use. Two spellings of one device are two trees, which the
+    proxy lets share the device.
 
     Discovery listens for `discover` seconds for the devices of the tree. It
     runs once per tree; `Tree.refresh()` runs it again.
     """
     key = _url_key(url)
-    tree = _trees.get(key)
-    if tree is None:
-        tree = Tree(url)
-        _trees[key] = tree
+    with _connect_lock:  # so that two threads do not open one URL twice
+        tree = _trees.get(key)
+        if tree is None:
+            tree = Tree(url)
+            _trees[key] = tree
     if discover and not tree._discovered:
         tree.refresh(discover)
     return tree
@@ -663,11 +682,21 @@ class Tree(Mapping[str, Device]):
     def __len__(self) -> int:
         return len(self._info)
 
-    def find(self, name: str | None = None, serial: str | None = None) -> list[Device]:
-        """Returns the devices whose `dev.name` (ignoring case) and `dev.serial`
-        match every criterion given, in route order."""
+    def find(
+        self,
+        name: str | None = None,
+        serial: str | None = None,
+        route: str | None = None,
+    ) -> list[Device]:
+        """Returns the devices whose `dev.name` (ignoring case), `dev.serial`
+        and route match every criterion given, in route order. A device that
+        did not answer discovery has no name or serial to match."""
+        if route is not None:
+            route = _twinleaf._parse_route(route)
         matches = []
         for info in self.info:
+            if route is not None and info.route != route:
+                continue
             if name is not None and (info.name or "").lower() != name.lower():
                 continue
             if serial is not None and info.serial != serial:
@@ -894,12 +923,17 @@ class Unified:
 
     Use `tree.unify("MAG")` to get one. `settings` holds the RPCs every
     device has, with the same type: calling one reads or writes it on every
-    device. `samples()` reads the same interval of each device's streams.
+    device, one device after another. A write that fails on one device stays
+    written on the others. `samples()` reads the same interval of each
+    device's streams; a stream is named without a route, such as "vector",
+    and means that stream of every device.
     """
 
     def __init__(self, devices: Sequence[Device]):
         if not devices:
             raise ValueError("unify needs at least one device")
+        # A device listed twice counts once.
+        devices = list({device._route: device for device in devices}.values())
         devices = sorted(devices, key=lambda d: _route_sort_key(d._route))
         trees = {id(device.tree) for device in devices}
         if len(trees) != 1:
@@ -945,24 +979,18 @@ class Unified:
                 (device._route, _Rpc(table[name], device))
                 for device, table in zip(self.devices, tables)
             ]
+            # Names are sorted, so an RPC comes before the RPCs below it.
             rpc = _UnifiedRpc(name, members)
-            existing = nodes.get(name)
-            if existing is not None:
-                # A survey made for longer names already: keep its children.
-                rpc.__dict__.update(
-                    {
-                        k: v
-                        for k, v in existing.__dict__.items()
-                        if isinstance(v, _UnifiedNode)
-                    }
-                )
             setattr(nodes[parent], "_rpc" if leaf == "rpc" else leaf, rpc)
             nodes[name] = rpc
 
-    def stream_paths(self, *streams: str) -> list[str]:
+    def stream_paths(self, streams: str | Sequence[str] | None = None) -> list[str]:
         """The paths of the named streams on every device, such as
         `["/0/vector", "/1/vector"]` for "vector". With no names, every stream
-        that is enabled on all the devices."""
+        that is enabled on all the devices. Streams are given as for
+        `samples()`: one name, or a list of names."""
+        if isinstance(streams, str):
+            streams = [streams]
         if not streams:
             per_device = [
                 {
@@ -999,9 +1027,7 @@ class Unified:
         clocks; `allow_mixed_timebases=True` reads each clock's latest window.
         See `Tree.samples()`."""
         seconds = _check_seconds(streams, seconds)
-        if isinstance(streams, str):
-            streams = [streams]
-        paths = self.stream_paths(*(streams or ()))
+        paths = self.stream_paths(streams)
         return self.tree.samples(
             paths,
             seconds=seconds,

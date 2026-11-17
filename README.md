@@ -64,7 +64,7 @@ for route, device in tree.items():
     print(route, device)
 ```
 
-The devices of a tree share one connection. `twinleaf.Device(url, route)` also reuses the tree for that `url`, so opening several devices on one port costs one connection. `twinleaf.connect([url1, url2])` mounts several devices as one tree at `/0`, `/1`, …. Discovery listens for two seconds; `tree.refresh()` looks again.
+The devices of a tree share one connection. `twinleaf.Device(url, route)` also reuses the tree for that `url`, so opening several devices on one port costs one connection, and it returns the same object as `tree[route]`. `twinleaf.connect([url1, url2])` mounts several devices as one tree at `/0`, `/1`, …. Discovery listens for two seconds; `tree.refresh()` looks again.
 
 `tree.close()` ends the connection, as does leaving `with twinleaf.connect(url) as tree:`. Every device on the connection stops working, and the port is released a few seconds later.
 
@@ -81,7 +81,7 @@ mags.settings.vector.data()                 # a survey, with Mixed values where 
 mags.samples('vector', seconds=5)           # the same 5 s of every magnetometer's vector stream
 ```
 
-The unified settings are the RPCs that every device has with the same type; `mags.not_shared` lists the rest. A call is tried on every device. If it fails on any of them, `twinleaf.UnifiedRpcError` is raised, holding the replies and errors by route. A `Mixed` value has no truth value, so `if mags.settings.x():` raises when the devices disagree instead of passing.
+The unified settings are the RPCs that every device has with the same type; `mags.not_shared` lists the rest. A call is tried on every device. If it fails on any of them, `twinleaf.UnifiedRpcError` is raised, holding the replies and errors by route. The devices are called one after another, and a write that fails on one stays written on the others. In `mags.samples()`, a stream name such as `vector` means that stream of every device. A `Mixed` value has no truth value, so `if mags.settings.x():` raises when the devices disagree instead of passing.
 
 ### Synchronized data from several devices
 
@@ -96,7 +96,7 @@ s.timebase                 # the clock every stream counts on
 s.gaps                     # samples lost within the slice
 ```
 
-The length is given in seconds and by name, as the streams have different rates; `device.samples.vector(10)` counts samples instead. A slice is a mapping of stream path to stream, so `s.items()` and `s.values()` work as on a dict. A stream is named by its device's route and its name: `/imu` on the device at `/`, `/0/vector` on the device at `/0`. Each stream keeps its own rate and its own `time` array; nothing is resampled. With no streams named, every stream that is enabled on its device is read.
+The length is given in seconds and by name, as the streams have different rates; `device.samples.vector(10)` counts samples instead. A slice is a mapping of stream path to stream, so `s.items()` and `s.values()` work as on a dict. A stream is named by its device's route and its name: `/imu` on the device at `/`, `/0/vector` on the device at `/0`. A name with no slash, such as `vector`, is the one stream with that name, and raises when several devices have it. Each stream keeps its own rate and its own `time` array; nothing is resampled. With no streams named, every stream that is enabled on its device is read.
 
 For repeated reads, an acquisition buffers every stream in the background:
 
@@ -126,6 +126,9 @@ r['/bar']['measure']       # now one value per vector row
 - `linear` interpolates between neighboring rows. It suits signals sampled well above their bandwidth.
 - Streams are aligned by end-of-sample time; device filter delays are not corrected.
 - A time where a stream has no value is NaN. That is before the stream's first row, after its last row for `linear`, or inside one of its gaps. `edges='trim'` drops those times instead.
+- `linear` gives float64. `previous` keeps a float column's dtype and makes any other column float64, so that it can hold NaN; with `edges='trim'` it keeps every dtype.
+- A method applies to every column of its stream, so use `previous` for a stream with counters or status flags. Resampling a fast stream onto a slower one does not average, so decimate it on the device first.
+- The arrays of a slice are read-only; copy one to change it.
 
 See [docs/multi-sensor-api.md](docs/multi-sensor-api.md) for the design.
 
