@@ -31,12 +31,12 @@ csb = twinleaf.Device('serial://COM1')
 csb.settings.coil.x.current(0.25) # mA
 ```
 
-To receive data streams from a sensor such as the [Twinleaf VMR vector magnetometer](http://www.twinleaf.com/vector/VMR), use the named streams:
+To receive data streams from a sensor such as a Twinleaf vector magnetometer, use the named streams:
 
 ```python
 import twinleaf
-vmr = twinleaf.Device('serial://COM1')
-print(vmr.samples.vector(10))
+mag = twinleaf.Device('serial://COM1')
+print(mag.samples.vector(10))
 ```
 
 To find possible tio ports to use run `tio list`. Windows will often output some COMx port such as `serial://COM3`, while Mac OS will output some cu.XXXXX or tty.XXXXX name such as `serial:///dev/cu.usbserialXXXXXX` or `serial:///dev/tty.usbmodemXXXXXX`. 
